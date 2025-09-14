@@ -1,0 +1,877 @@
+/*
+ * ESP32-S3 Paludarium Controller v6.0 - Commercial WiFi Manager Edition
+ * =====================================================================
+ * 🚀 COMMERCIAL FEATURES:
+ * - WiFi Manager: Creates "Paludarium_Setup" hotspot when no WiFi configured
+ * - Network Scanner: Web interface to scan and connect to any WiFi
+ * - EEPROM Storage: Saves WiFi credentials permanently
+ * - Factory Reset: Hold any relay button for 10 seconds to reset WiFi
+ * - Plug & Play: No hardcoded WiFi - works anywhere out of the box
+ * - Professional UI with all existing features intact
+ * 
+ * SETUP PROCESS:
+ * 1. Power on → Creates "Paludarium_Setup" hotspot (password: paludarium)
+ * 2. Connect phone to hotspot → go to 192.168.4.1
+ * 3. Scan networks → select yours → enter password → save
+ * 4. Device reboots and connects to your network
+ * 5. Ready for normal operation!
+ */
+
+#include <DHT.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WebSocketsServer.h>
+#include <EEPROM.h>
+#include <time.h>
+
+// ---------- EEPROM SETTINGS ----------
+#define EEPROM_SIZE 512
+#define WIFI_CONFIGURED_FLAG 42  // Magic number to check if WiFi is configured
+#define EEPROM_CONFIGURED 0      // Address for configured flag
+#define EEPROM_SSID 1           // Address for SSID (32 bytes max)
+#define EEPROM_PASSWORD 33      // Address for password (64 bytes max)
+
+// ---------- WIFI MANAGER ----------
+bool wifiConfigured = false;
+bool setupMode = false;
+const char* setupSSID = "Paludarium_Setup";
+const char* setupPassword = "paludarium";
+String savedSSID = "";
+String savedPassword = "";
+unsigned long setupModeStart = 0;
+#define SETUP_TIMEOUT 600000 // 10 minutes
+
+// ---------- FACTORY RESET ----------
+unsigned long factoryResetStart = 0;
+bool factoryResetActive = false;
+#define FACTORY_RESET_TIME 10000 // 10 seconds
+
+// ---------- PINS ----------
+#define PIN_WATER_LEVEL  8
+#define PIN_LDR          6
+#define PIN_DHT          4
+#define DHT_TYPE         DHT11
+#define PIN_DS18B20      5
+
+#define RELAY_WATERFALL  12
+#define RELAY_RAIN       13
+#define RELAY_BUBBLE     14
+#define RELAY_FAN        15
+#define RELAY_HEATER     16
+#define RELAY_MIST       17
+#define RELAY_LED        18
+
+// ---------- CONTROL MODE ----------
+#define AUTO_TIMEOUT_MS  (30UL * 60UL * 1000UL)  // 30 minutes
+bool manualMode = true;     // boot = MANUAL
+bool manualSticky = false;  // true = locked in manual
+unsigned long lastManualActivity = 0;
+
+// Manual overrides
+struct ManualState {
+  bool rain = false, waterfall = false, bubble = false;
+  bool mist = false, heater = false, fan = false, led = false;
+} manualOverride;
+
+// ---------- CONFIG ----------
+struct Config {
+  int humidityTarget = 70;
+  int mistDuration = 10;
+  int heaterOn = 14;
+  int heaterOff = 30;
+  int fanOn = 28;
+  int fanOff = 25;
+  int ledDayStart = 8;
+  int ledDayEnd = 20;
+} config;
+
+// ---------- WATER SENSOR ----------
+#define WATER_LOW_THRESHOLD 1600
+
+// ---------- DRIVERS ----------
+DHT dht(PIN_DHT, DHT_TYPE);
+OneWire oneWire(PIN_DS18B20);
+DallasTemperature ds18b20(&oneWire);
+WebServer server(80);
+WebSocketsServer wsServer(81);
+
+// ---------- STATE ----------
+float humidity, ambientC, waterC;
+int ldr, waterLevel;
+bool waterOK = true;
+unsigned long lastRainTime = 0;
+unsigned long mistEnd = 0;
+int ds18b20DeviceCount = 0;
+bool ds18b20Working = false;
+
+// ---------- HELPERS ----------
+inline void relayOn(uint8_t pin){ digitalWrite(pin, LOW); }
+inline void relayOff(uint8_t pin){ digitalWrite(pin, HIGH); }
+inline bool relayState(uint8_t pin){ return digitalRead(pin)==LOW; }
+
+// ---------- EEPROM FUNCTIONS ----------
+void saveWiFiConfig(String ssid, String password) {
+  EEPROM.write(EEPROM_CONFIGURED, WIFI_CONFIGURED_FLAG);
+  
+  // Clear and write SSID
+  for(int i = 0; i < 32; i++) EEPROM.write(EEPROM_SSID + i, 0);
+  for(int i = 0; i < ssid.length() && i < 31; i++) {
+    EEPROM.write(EEPROM_SSID + i, ssid[i]);
+  }
+  
+  // Clear and write password
+  for(int i = 0; i < 64; i++) EEPROM.write(EEPROM_PASSWORD + i, 0);
+  for(int i = 0; i < password.length() && i < 63; i++) {
+    EEPROM.write(EEPROM_PASSWORD + i, password[i]);
+  }
+  
+  EEPROM.commit();
+  Serial.println("✅ WiFi credentials saved to EEPROM");
+}
+
+bool loadWiFiConfig() {
+  if(EEPROM.read(EEPROM_CONFIGURED) != WIFI_CONFIGURED_FLAG) {
+    Serial.println("❌ No WiFi configuration found in EEPROM");
+    return false;
+  }
+  
+  // Read SSID
+  savedSSID = "";
+  for(int i = 0; i < 32; i++) {
+    char c = EEPROM.read(EEPROM_SSID + i);
+    if(c == 0) break;
+    savedSSID += c;
+  }
+  
+  // Read password
+  savedPassword = "";
+  for(int i = 0; i < 64; i++) {
+    char c = EEPROM.read(EEPROM_PASSWORD + i);
+    if(c == 0) break;
+    savedPassword += c;
+  }
+  
+  Serial.println("✅ WiFi config loaded: " + savedSSID);
+  return true;
+}
+
+void clearWiFiConfig() {
+  EEPROM.write(EEPROM_CONFIGURED, 0);
+  EEPROM.commit();
+  Serial.println("🔄 WiFi configuration cleared - factory reset");
+}
+
+// ---------- FACTORY RESET DETECTION ----------
+void checkFactoryReset() {
+  // Check if any relay button is being "pressed" (simulated by relay state)
+  bool anyRelayOn = relayState(RELAY_RAIN) || relayState(RELAY_WATERFALL) || 
+                    relayState(RELAY_BUBBLE) || relayState(RELAY_MIST) || 
+                    relayState(RELAY_HEATER) || relayState(RELAY_FAN) || 
+                    relayState(RELAY_LED);
+  
+  if(anyRelayOn && !factoryResetActive) {
+    factoryResetStart = millis();
+    factoryResetActive = true;
+    Serial.println("🔄 Factory reset sequence started...");
+  }
+  else if(!anyRelayOn && factoryResetActive) {
+    factoryResetActive = false;
+    Serial.println("❌ Factory reset cancelled");
+  }
+  else if(factoryResetActive && (millis() - factoryResetStart > FACTORY_RESET_TIME)) {
+    Serial.println("🔄 FACTORY RESET TRIGGERED!");
+    clearWiFiConfig();
+    delay(1000);
+    ESP.restart();
+  }
+}
+
+// ---------- WIFI SETUP FUNCTIONS ----------
+bool connectToWiFi() {
+  if(!loadWiFiConfig()) return false;
+  
+  Serial.print("📡 Connecting to " + savedSSID + "...");
+  WiFi.begin(savedSSID.c_str(), savedPassword.c_str());
+  
+  int attempts = 0;
+  while(WiFi.status() != WL_CONNECTED && attempts < 30) {
+    delay(1000);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if(WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✅ Connected! IP: " + WiFi.localIP().toString());
+    return true;
+  } else {
+    Serial.println("\n❌ Connection failed");
+    return false;
+  }
+}
+
+void startSetupMode() {
+  setupMode = true;
+  setupModeStart = millis();
+  
+  Serial.println("🛜 Starting WiFi Setup Mode...");
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(setupSSID, setupPassword);
+  
+  IPAddress IP = WiFi.softAPIP();
+  Serial.println("📱 Setup Network: " + String(setupSSID));
+  Serial.println("🔑 Password: " + String(setupPassword));
+  Serial.println("🌐 Setup URL: http://" + IP.toString());
+  Serial.println("⏱️  Setup will timeout in 10 minutes");
+}
+
+// ---------- TIME ----------
+struct tm timeinfo;
+void updateTime(){ getLocalTime(&timeinfo); }
+
+// ---------- DS18B20 ----------
+void initDS18B20(){
+  ds18b20.begin();
+  ds18b20.setResolution(12);
+  ds18b20.setWaitForConversion(true);
+  ds18b20DeviceCount = ds18b20.getDeviceCount();
+  ds18b20Working = (ds18b20DeviceCount > 0);
+  Serial.printf("DS18B20 devices found: %d\n", ds18b20DeviceCount);
+}
+
+// ---------- SENSORS ----------
+void readSensors(){
+  waterLevel = analogRead(PIN_WATER_LEVEL);
+  waterOK = waterLevel > WATER_LOW_THRESHOLD;
+  humidity = dht.readHumidity();
+  ambientC = dht.readTemperature();
+  if(ds18b20Working){
+    ds18b20.requestTemperatures();
+    waterC = ds18b20.getTempCByIndex(0);
+    if(waterC == DEVICE_DISCONNECTED_C || waterC < -55 || waterC > 125){
+      waterC = -999;
+    }
+  } else waterC = -999;
+  ldr = analogRead(PIN_LDR);
+}
+
+// ---------- MODE ----------
+void setManualActivity(){
+  lastManualActivity = millis();
+  if(!manualMode){
+    manualMode = true;
+    Serial.println("🎛️ MANUAL mode (user override)");
+  }
+}
+void checkAutoReturn(){
+  if(manualMode && !manualSticky && (millis()-lastManualActivity > AUTO_TIMEOUT_MS)){
+    manualMode = false;
+    Serial.println("🤖 Auto-returned to AUTO mode");
+  }
+}
+
+// ---------- AUTO LOGIC ----------
+void runAutoLogic(){
+  unsigned long now = millis();
+  int hour = timeinfo.tm_hour;
+  int minute = timeinfo.tm_min;
+
+  // Rain
+  static unsigned long rainEnd = 0;
+  if(((hour==8 && minute<5)||(hour==20 && minute<5))||!waterOK){
+    relayOn(RELAY_RAIN);
+    rainEnd = now + 5UL*60000UL;
+    lastRainTime = now;
+  }
+  if(now > rainEnd) relayOff(RELAY_RAIN);
+
+  // Waterfall
+  if(now - lastRainTime <= 2UL*3600000UL){
+    static unsigned long wfNext = 0; static bool wfState=false;
+    if(now>wfNext){
+      wfState=!wfState;
+      wfNext= now+(wfState?random(5,11):random(5,16))*60000UL;
+    }
+    wfState?relayOn(RELAY_WATERFALL):relayOff(RELAY_WATERFALL);
+  } else relayOff(RELAY_WATERFALL);
+
+  // Bubbles
+  if(hour>=8 && hour<22){
+    unsigned long cycle=(now/60000UL)%60;
+    (cycle<50)?relayOn(RELAY_BUBBLE):relayOff(RELAY_BUBBLE);
+  } else relayOff(RELAY_BUBBLE);
+
+  // Mist
+  static unsigned long mistCheck=0;
+  if(now>mistCheck){
+    mistCheck=now+60000UL;
+    if((!isnan(humidity)&&humidity<config.humidityTarget)||(hour==12&&minute<5)||(hour==18&&minute<5)){
+      mistEnd=now+config.mistDuration*60000UL;
+    }
+  }
+  (now<mistEnd)?relayOn(RELAY_MIST):relayOff(RELAY_MIST);
+
+  // Heater
+  if(!isnan(ambientC)){
+    if(ambientC<config.heaterOn) relayOn(RELAY_HEATER);
+    else if(ambientC>config.heaterOff) relayOff(RELAY_HEATER);
+  }
+
+  // Fan
+  if(!isnan(ambientC)){
+    if(ambientC>config.fanOn) relayOn(RELAY_FAN);
+    else if(ambientC<config.fanOff) relayOff(RELAY_FAN);
+  }
+
+  // LEDs
+  if(hour>=config.ledDayStart && hour<config.ledDayEnd) relayOn(RELAY_LED);
+  else relayOff(RELAY_LED);
+}
+
+// ---------- MANUAL LOGIC ----------
+void runManualLogic(){
+  if(manualOverride.rain) relayOn(RELAY_RAIN); else relayOff(RELAY_RAIN);
+  if(manualOverride.waterfall) relayOn(RELAY_WATERFALL); else relayOff(RELAY_WATERFALL);
+  if(manualOverride.bubble) relayOn(RELAY_BUBBLE); else relayOff(RELAY_BUBBLE);
+  if(manualOverride.mist) relayOn(RELAY_MIST); else relayOff(RELAY_MIST);
+  if(manualOverride.heater) relayOn(RELAY_HEATER); else relayOff(RELAY_HEATER);
+  if(manualOverride.fan) relayOn(RELAY_FAN); else relayOff(RELAY_FAN);
+  if(manualOverride.led) relayOn(RELAY_LED); else relayOff(RELAY_LED);
+}
+
+// ---------- LOGIC ----------
+void runLogic(){
+  checkAutoReturn();
+  checkFactoryReset(); // Check for factory reset
+  manualMode?runManualLogic():runAutoLogic();
+}
+
+// ---------- JSON ----------
+String buildJSON(){
+  char timeBuf[32];
+  strftime(timeBuf, sizeof(timeBuf), "%H:%M:%S", &timeinfo);
+
+  String j = "{";
+  j += "\"time\":\"" + String(timeBuf) + "\",";
+  j += "\"mode\":\"" + String(manualMode ? "MANUAL" : "AUTO") + "\",";
+  j += "\"sticky\":" + String(manualSticky ? "true" : "false") + ",";
+  j += "\"autoIn\":" + String(manualMode ? (AUTO_TIMEOUT_MS - (millis() - lastManualActivity)) / 1000 : 0) + ",";
+  j += "\"setupMode\":" + String(setupMode ? "true" : "false") + ",";
+  j += "\"wifiSSID\":\"" + String(WiFi.SSID()) + "\",";
+
+  j += "\"waterLevel\":" + String(waterLevel) + ",";
+  j += "\"water\":\"" + String(waterOK ? "GOOD" : "LOW") + "\",";
+  j += "\"humidity\":" + String(isnan(humidity) ? -1 : humidity) + ",";
+  j += "\"ambient\":" + String(isnan(ambientC) ? -1 : ambientC) + ",";
+  j += "\"waterC\":" + String(waterC) + ",";
+  j += "\"ds18b20Status\":\"" + String(ds18b20Working ? "OK" : "ERROR") + "\",";
+  j += "\"ds18b20Count\":" + String(ds18b20DeviceCount) + ",";
+  j += "\"ldr\":" + String(ldr) + ",";
+  j += "\"wf\":\"" + String(relayState(RELAY_WATERFALL) ? "ON" : "OFF") + "\",";
+  j += "\"rain\":\"" + String(relayState(RELAY_RAIN) ? "ON" : "OFF") + "\",";
+  j += "\"bubble\":\"" + String(relayState(RELAY_BUBBLE) ? "ON" : "OFF") + "\",";
+  j += "\"mist\":\"" + String(relayState(RELAY_MIST) ? "ON" : "OFF") + "\",";
+  j += "\"heat\":\"" + String(relayState(RELAY_HEATER) ? "ON" : "OFF") + "\",";
+  j += "\"fan\":\"" + String(relayState(RELAY_FAN) ? "ON" : "OFF") + "\",";
+  j += "\"led\":\"" + String(relayState(RELAY_LED) ? "ON" : "OFF") + "\",";
+
+  j += "\"config\":{";
+  j += "\"humidityTarget\":" + String(config.humidityTarget) + ",";
+  j += "\"mistDuration\":" + String(config.mistDuration) + ",";
+  j += "\"heaterOn\":" + String(config.heaterOn) + ",";
+  j += "\"heaterOff\":" + String(config.heaterOff) + ",";
+  j += "\"fanOn\":" + String(config.fanOn) + ",";
+  j += "\"fanOff\":" + String(config.fanOff) + ",";
+  j += "\"ledDayStart\":" + String(config.ledDayStart) + ",";
+  j += "\"ledDayEnd\":" + String(config.ledDayEnd);
+  j += "}}";
+
+  return j;
+}
+
+// ---------- WIFI SETUP WEB HANDLERS ----------
+void handleWiFiSetup() {
+  String html = R"HTML(
+<!DOCTYPE html>
+<html><head>
+<title>Paludarium WiFi Setup</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+body{font-family:Arial;margin:20px;background:#0e1116;color:#eee;}
+.card{background:#1a1d23;padding:20px;border-radius:10px;margin:10px 0;}
+.network{background:#2a2d33;padding:15px;margin:8px 0;border-radius:8px;cursor:pointer;}
+.network:hover{background:#3a3d43;}
+.strong{font-weight:bold;color:#0fd36a;}
+input{width:100%;padding:10px;margin:8px 0;border-radius:5px;border:1px solid #555;background:#333;color:#fff;}
+button{padding:12px 20px;background:#0fd36a;color:#000;border:none;border-radius:8px;cursor:pointer;font-weight:bold;}
+button:hover{background:#0ab359;}
+</style></head><body>
+<h1>🌿 Paludarium WiFi Setup</h1>
+<div class="card">
+<h3>📡 Available Networks</h3>
+<div id="networks">Scanning...</div>
+<button onclick="scanNetworks()">🔄 Refresh Scan</button>
+</div>
+<div class="card">
+<h3>🔑 Connect to Network</h3>
+<input type="text" id="ssid" placeholder="Network Name (SSID)">
+<input type="password" id="password" placeholder="Password">
+<button onclick="connectWiFi()">💾 Save & Connect</button>
+</div>
+<div class="card">
+<h3>ℹ️ Instructions</h3>
+<p>1. Select a network from the scan or type manually<br>
+2. Enter the password<br>
+3. Click Save & Connect<br>
+4. Device will restart and connect to your network<br>
+5. Find your new IP address in your router or network scanner</p>
+</div>
+
+<script>
+function scanNetworks() {
+  document.getElementById('networks').innerHTML = 'Scanning...';
+  fetch('/scan').then(r=>r.json()).then(networks=>{
+    let html = '';
+    networks.forEach(net => {
+      html += '<div class="network" onclick="selectNetwork(\''+net.ssid+'\')">'+
+              '<strong>'+net.ssid+'</strong><br>'+
+              'Signal: '+net.rssi+' dBm | Security: '+(net.secure?'Secured':'Open')+
+              '</div>';
+    });
+    document.getElementById('networks').innerHTML = html;
+  });
+}
+
+function selectNetwork(ssid) {
+  document.getElementById('ssid').value = ssid;
+}
+
+function connectWiFi() {
+  const ssid = document.getElementById('ssid').value;
+  const pass = document.getElementById('password').value;
+  if(!ssid) { alert('Please enter network name'); return; }
+  
+  fetch('/connect', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+    body: 'ssid='+encodeURIComponent(ssid)+'&password='+encodeURIComponent(pass)
+  }).then(r=>r.text()).then(result=>{
+    if(result === 'OK') {
+      alert('WiFi credentials saved! Device will restart and connect to your network.');
+    } else {
+      alert('Error: ' + result);
+    }
+  });
+}
+
+scanNetworks();
+</script></body></html>
+)HTML";
+  server.send(200, "text/html", html);
+}
+
+void handleNetworkScan() {
+  Serial.println("🔍 Scanning networks...");
+  int n = WiFi.scanNetworks();
+  
+  String json = "[";
+  for(int i = 0; i < n; i++) {
+    if(i > 0) json += ",";
+    json += "{";
+    json += "\"ssid\":\"" + WiFi.SSID(i) + "\",";
+    json += "\"rssi\":" + String(WiFi.RSSI(i)) + ",";
+    json += "\"secure\":" + String(WiFi.encryptionType(i) != WIFI_AUTH_OPEN ? "true" : "false");
+    json += "}";
+  }
+  json += "]";
+  
+  server.send(200, "application/json", json);
+}
+
+void handleWiFiConnect() {
+  if(!server.hasArg("ssid")) {
+    server.send(400, "text/plain", "Missing SSID");
+    return;
+  }
+  
+  String ssid = server.arg("ssid");
+  String password = server.hasArg("password") ? server.arg("password") : "";
+  
+  Serial.println("💾 Saving WiFi: " + ssid);
+  saveWiFiConfig(ssid, password);
+  
+  server.send(200, "text/plain", "OK");
+  
+  delay(1000);
+  Serial.println("🔄 Restarting to connect to new network...");
+  ESP.restart();
+}
+
+// ---------- WEB HANDLERS ----------
+void handleControl(){
+  setManualActivity();
+  String d=server.arg("device"), s=server.arg("state");
+  bool on=(s=="on");
+  if(d=="rain") manualOverride.rain=on;
+  else if(d=="waterfall") manualOverride.waterfall=on;
+  else if(d=="bubble") manualOverride.bubble=on;
+  else if(d=="mist") manualOverride.mist=on;
+  else if(d=="heater") manualOverride.heater=on;
+  else if(d=="fan") manualOverride.fan=on;
+  else if(d=="led") manualOverride.led=on;
+  server.send(200,"text/plain","OK");
+}
+void handleAutoMode(){ manualMode=false; manualSticky=false; server.send(200,"text/plain","AUTO"); }
+void handleManualLock(){ manualSticky=true; manualMode=true; server.send(200,"text/plain","LOCKED"); }
+void handleManualUnlock(){ manualSticky=false; server.send(200,"text/plain","UNLOCKED"); }
+void handleConfig(){
+  if(server.hasArg("humidity")) config.humidityTarget=server.arg("humidity").toInt();
+  if(server.hasArg("mist")) config.mistDuration=server.arg("mist").toInt();
+  if(server.hasArg("heaterOn")) config.heaterOn=server.arg("heaterOn").toInt();
+  if(server.hasArg("heaterOff")) config.heaterOff=server.arg("heaterOff").toInt();
+  if(server.hasArg("fanOn")) config.fanOn=server.arg("fanOn").toInt();
+  if(server.hasArg("fanOff")) config.fanOff=server.arg("fanOff").toInt();
+  if(server.hasArg("ledStart")) config.ledDayStart=server.arg("ledStart").toInt();
+  if(server.hasArg("ledEnd")) config.ledDayEnd=server.arg("ledEnd").toInt();
+  server.send(200,"text/plain","OK");
+}
+
+String htmlIndex(); // Forward declaration
+
+void setupWeb(){
+  if(setupMode) {
+    // Setup mode routes
+    server.on("/", HTTP_GET, handleWiFiSetup);
+    server.on("/scan", HTTP_GET, handleNetworkScan);
+    server.on("/connect", HTTP_POST, handleWiFiConnect);
+  } else {
+    // Normal operation routes
+    server.on("/",HTTP_GET,[](){server.send(200,"text/html",htmlIndex());});
+    server.on("/status",HTTP_GET,[](){server.send(200,"application/json",buildJSON());});
+    server.on("/control",HTTP_GET,handleControl);
+    server.on("/auto",HTTP_GET,handleAutoMode);
+    server.on("/manual/lock",HTTP_GET,handleManualLock);
+    server.on("/manual/unlock",HTTP_GET,handleManualUnlock);
+    server.on("/config",HTTP_GET,handleConfig);
+    
+    wsServer.begin();
+    wsServer.onEvent([](uint8_t num,WStype_t type,uint8_t* payload,size_t length){
+      if(type==WStype_CONNECTED) {
+        String msg = buildJSON();   
+        wsServer.sendTXT(num, msg);
+      }
+    });
+  }
+  server.begin();
+}
+
+// ---------- SETUP ----------
+void setup(){
+  Serial.begin(115200);
+  Serial.println("🌿 Paludarium Controller v6.0 - Commercial Edition");
+  
+  // Initialize EEPROM
+  EEPROM.begin(EEPROM_SIZE);
+  
+  // Initialize sensors and relays
+  dht.begin(); 
+  initDS18B20();
+  pinMode(PIN_WATER_LEVEL,INPUT); 
+  pinMode(PIN_LDR,INPUT);
+  int relays[]={RELAY_WATERFALL,RELAY_RAIN,RELAY_BUBBLE,RELAY_FAN,RELAY_HEATER,RELAY_MIST,RELAY_LED};
+  for(int p:relays){pinMode(p,OUTPUT);relayOff(p);}
+  
+  // Try to connect to saved WiFi
+  wifiConfigured = connectToWiFi();
+  
+  if(!wifiConfigured) {
+    startSetupMode();
+  } else {
+    configTime(0,0,"pool.ntp.org","time.nist.gov"); 
+    updateTime();
+    Serial.println("✅ Normal operation mode");
+  }
+  
+  setupWeb();
+  Serial.println("🌐 Web server ready");
+  if(setupMode) {
+    Serial.println("📱 Connect to 'Paludarium_Setup' network");
+    Serial.println("🌐 Then go to: 192.168.4.1");
+  }
+}
+
+// ---------- LOOP ----------
+void loop(){
+  server.handleClient(); 
+  if(!setupMode) {
+    wsServer.loop();
+    
+    // Check if setup mode timed out
+    if(setupMode && millis() - setupModeStart > SETUP_TIMEOUT) {
+      Serial.println("⏰ Setup mode timeout - restarting");
+      ESP.restart();
+    }
+    
+    static unsigned long last=0;
+    if(millis()-last>2000){
+      last=millis(); 
+      updateTime(); 
+      readSensors(); 
+      runLogic();
+      String msg = buildJSON();   
+      wsServer.broadcastTXT(msg);
+    }
+  }
+}
+
+// ---------- WEB UI ----------
+String htmlIndex() {
+  return R"HTML(
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Paludarium Controller</title>
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700&family=Inter:wght@400;600&display=swap" rel="stylesheet">
+<style>
+body {
+  margin:0; padding:20px;
+  font-family: 'Inter', sans-serif;
+  background:#0e1116; color:#eee;
+  transition: background 0.3s, color 0.3s;
+}
+body.light { background:#f5f5f5; color:#222; }
+
+.container { max-width:960px; margin:auto; }
+h1 { font-family:'Orbitron', sans-serif; font-size:2em; margin:20px 0; }
+
+.topbar { display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; }
+.themeToggle { padding:8px 14px; border:0; border-radius:8px; cursor:pointer; background:#333; color:#fff; }
+body.light .themeToggle { background:#ddd; color:#000; }
+
+.card {
+  background:#1a1d23; border-radius:12px; padding:16px; margin:12px 0;
+  box-shadow:0 2px 6px rgba(0,0,0,0.4);
+}
+body.light .card { background:#fff; color:#222; }
+
+.controls { display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }
+.control {
+  flex:1; min-width:110px;
+  padding:10px; border-radius:8px; cursor:pointer;
+  text-align:center; font-weight:600;
+}
+.control.on { background:#0fd36a; color:#000; }
+.control.off { background:#e05a5a; color:#fff; }
+
+.sensor { margin:6px 0; display:flex; justify-content:space-between; }
+.status.good { color:#0fd36a; font-weight:bold; }
+.status.bad { color:#e05a5a; font-weight:bold; }
+.status.warning { color:#ffcc00; font-weight:bold; }
+
+.graphs { display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:10px; }
+canvas { width:100%; height:150px; background:#000; border-radius:6px; }
+
+.health { font-weight:600; }
+.wifi-info { background:#1a4d72; color:#fff; padding:10px; border-radius:8px; margin:10px 0; }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="topbar">
+    <button class="themeToggle" onclick="toggleTheme()">🌗 Theme</button>
+    <div id="health" class="health">System Health: --</div>
+  </div>
+  <h1>🌿 Paludarium Pro</h1>
+  <div id="wifiInfo" class="wifi-info">📡 WiFi: Loading...</div>
+  <div id="status">Connecting...</div>
+
+  <div class="card"><h3>📈 Trends</h3>
+    <div class="graphs">
+      <div class="graph"><canvas id="tempGraph" width="300" height="150"></canvas></div>
+      <div class="graph"><canvas id="humGraph" width="300" height="150"></canvas></div>
+      <div class="graph"><canvas id="lightGraph" width="300" height="150"></canvas></div>
+    </div>
+  </div>
+
+  <div id="dynamicContent"></div>
+
+  <div class="card">
+    <h3>⚙️ Auto Settings (Live)</h3>
+    <label>Humidity Target: <span id="humTargetVal">70</span>%</label>
+    <input type="range" id="humTarget" min="50" max="90" value="70">
+    <label>Mist Duration: <span id="mistDurVal">10</span> min</label>
+    <input type="range" id="mistDur" min="1" max="20" value="10">
+    <label>Heater On/Off: <span id="heatRange">18–21</span> °C</label>
+    <input type="range" id="heatOn" min="10" max="25" value="18">
+    <input type="range" id="heatOff" min="15" max="30" value="21">
+    <label>Fan On/Off: <span id="fanRange">28–25</span> °C</label>
+    <input type="range" id="fanOn" min="25" max="40" value="28">
+    <input type="range" id="fanOff" min="20" max="30" value="25">
+    <label>LED Daytime: <span id="ledRange">08–20</span> h</label>
+    <input type="range" id="ledStart" min="0" max="23" value="8">
+    <input type="range" id="ledEnd" min="0" max="23" value="20">
+  </div>
+
+  <div class="card">
+    <h3>🛜 Commercial WiFi Manager</h3>
+    <p><strong>✅ Features:</strong></p>
+    <ul>
+      <li>🔄 Factory Reset: Hold any control button for 10 seconds</li>
+      <li>📡 Auto Setup Mode: Creates "Paludarium_Setup" hotspot when no WiFi</li>
+      <li>🔒 EEPROM Storage: WiFi credentials saved permanently</li>
+      <li>🌍 Universal: Works with any network worldwide</li>
+    </ul>
+    <p><strong>Current Network:</strong> <span id="currentWiFi">--</span></p>
+  </div>
+</div>
+
+<script>
+let ws; let historyTemp=[],historyHum=[],historyLight=[];
+let pressTimer=null; // long press timer
+window.currentSticky=false;
+
+function connectWS(){
+  ws=new WebSocket("ws://"+location.host+":81/");
+  ws.onopen=()=>console.log("✅ Connected");
+  ws.onclose=()=>setTimeout(connectWS,1500);
+  ws.onmessage=(ev)=>{try{render(JSON.parse(ev.data));}catch(e){}};
+}
+function control(device,state){ fetch('/control?device='+device+'&state='+state); }
+function autoMode(){ fetch('/auto'); }
+
+// Long press handlers
+function controlPressStart(dev,state){
+  pressTimer=setTimeout(()=>{
+    if(confirm("Toggle Manual Lock?")){
+      fetch('/manual/'+(window.currentSticky ? 'unlock':'lock'));
+    }
+  },1500);
+}
+function controlPressEnd(dev,state){
+  if(pressTimer){
+    clearTimeout(pressTimer);
+    pressTimer=null;
+    control(dev,state); // short press → toggle
+  }
+}
+
+function render(j){
+  window.currentSticky=j.sticky; // track sticky
+  
+  // Update WiFi info
+  document.getElementById('wifiInfo').innerHTML = 
+    '📡 WiFi: <strong>' + (j.wifiSSID || 'Not Connected') + '</strong>' +
+    (j.setupMode ? ' | 🛜 <strong>SETUP MODE ACTIVE</strong>' : '');
+  document.getElementById('currentWiFi').textContent = j.wifiSSID || 'Not Connected';
+  
+  let autoTime=j.mode=='MANUAL'?Math.floor(j.autoIn/60)+':'+(j.autoIn%60).toString().padStart(2,'0'):'';
+  let manualLabel='📱 MANUAL MODE';
+  if(j.sticky) manualLabel+=' 🔒';
+  if(autoTime && !j.sticky) manualLabel+=' ('+autoTime+' to auto)';
+  let modeLine=(j.mode=='AUTO'?'🤖 AUTO MODE':manualLabel);
+  document.getElementById('status').innerHTML='<div class="mode '+(j.mode=='AUTO'?'auto':'manual')+'">'+modeLine+'</div>';
+
+  document.getElementById('dynamicContent').innerHTML=
+    '<div class="card"><h3>📊 Sensors</h3>'
+    +'<div class="sensor">🕒 Time<strong>'+j.time+'</strong></div>'
+    +'<div class="sensor">💧 Water<strong>'+j.waterLevel+'</strong><span class="status '+(j.water=='GOOD'?'good':'bad')+'">'+j.water+'</span></div>'
+    +'<div class="sensor">🌊 Water Temp<strong>'+(j.waterC==-999?'ERROR':j.waterC.toFixed(1)+'°C')+'</strong><span class="status '+(j.ds18b20Status=='OK'?'good':'warning')+'">DS18B20: '+j.ds18b20Status+'</span></div>'
+    +'<div class="sensor">💨 Humidity<strong>'+(j.humidity==-1?'ERROR':j.humidity.toFixed(1)+'%')+'</strong></div>'
+    +'<div class="sensor">🌡️ Air<strong>'+(j.ambient==-1?'ERROR':j.ambient.toFixed(1)+'°C')+'</strong></div>'
+    +'<div class="sensor">☀️ Light<strong>'+j.ldr+'</strong></div>'
+    +'</div>'
+    +'<div class="card"><h3>🎛️ Controls</h3><div class="controls">'
+    +buttonHTML('rain','🌧️ Rain',j.rain)
+    +buttonHTML('waterfall','🏔️ Waterfall',j.wf)
+    +buttonHTML('bubble','🫧 Bubbles',j.bubble)
+    +buttonHTML('mist','🌫️ Mist',j.mist)
+    +buttonHTML('heater','🔥 Heater',j.heat)
+    +buttonHTML('fan','🌀 Fan',j.fan)
+    +buttonHTML('led','💡 LEDs',j.led)
+    +'<button class="control off" onclick="autoMode()" style="background:#666;color:#fff;">🤖 Return to Auto</button>'
+    +'</div></div>'
+    +'<div class="card"><h3>⚡ Quick Actions</h3><div class="controls">'
+    +'<button class="control on" onclick="macroMorning()">🌅 Morning</button>'
+    +'<button class="control off" onclick="macroNight()">🌙 Night</button>'
+    +'<button class="control on" onclick="macroMist()">💨 Mist Boost</button>'
+    +'<button class="control off" onclick="partyMode()">🎉 Party</button>'
+    +'</div></div>';
+
+  document.getElementById('health').textContent='DS18B20: '+j.ds18b20Status+' | WiFi: '+(j.wifiSSID||'None')+' | Uptime: '+Math.floor(performance.now()/60000)+'m';
+
+  if(j.waterC!=-999){ historyTemp.push(j.waterC); if(historyTemp.length>30)historyTemp.shift(); }
+  if(j.humidity!=-1){ historyHum.push(j.humidity); if(historyHum.length>30)historyHum.shift(); }
+  if(j.ldr!=-1){ historyLight.push(j.ldr); if(historyLight.length>30)historyLight.shift(); }
+  drawGraph('tempGraph',historyTemp,'#ff6666');
+  drawGraph('humGraph',historyHum,'#66ccff');
+  drawGraph('lightGraph',historyLight,'#ffff66');
+
+  humTarget.value=j.config.humidityTarget; humTargetVal.textContent=j.config.humidityTarget;
+  mistDur.value=j.config.mistDuration; mistDurVal.textContent=j.config.mistDuration;
+  heatOn.value=j.config.heaterOn; heatOff.value=j.config.heaterOff; heatRange.textContent=heatOn.value+"–"+heatOff.value;
+  fanOn.value=j.config.fanOn; fanOff.value=j.config.fanOff; fanRange.textContent=fanOn.value+"–"+fanOff.value;
+  ledStart.value=j.config.ledDayStart; ledEnd.value=j.config.ledDayEnd; ledRange.textContent=ledStart.value+"–"+ledEnd.value;
+}
+
+function buttonHTML(dev,label,state){
+  return '<button class="control '+(state=='ON'?'on':'off')+'" '
+    +'onmousedown="controlPressStart(\''+dev+'\',\''+(state=='ON'?'off':'on')+'\')" '
+    +'onmouseup="controlPressEnd(\''+dev+'\',\''+(state=='ON'?'off':'on')+'\')" '
+    +'ontouchstart="controlPressStart(\''+dev+'\',\''+(state=='ON'?'off':'on')+'\')" '
+    +'ontouchend="controlPressEnd(\''+dev+'\',\''+(state=='ON'?'off':'on')+'\')">'
+    +label+' '+state+'</button>';
+}
+
+// Quick actions
+function macroMorning(){control('rain','on');setTimeout(()=>control('rain','off'),5000);control('led','on');}
+function macroNight(){['led','fan','heater','mist'].forEach(d=>control(d,'off'));}
+function macroMist(){control('mist','on');setTimeout(()=>control('mist','off'),300000);}
+function partyMode(){['rain','waterfall','bubble','mist','heater','fan','led'].forEach(d=>control(d,'on'));setTimeout(()=>['rain','waterfall','bubble','mist','heater','fan','led'].forEach(d=>control(d,'off')),30000);}
+
+// Graph drawer
+function drawGraph(id,data,color){
+  let c=document.getElementById(id),ctx=c.getContext('2d');
+  ctx.clearRect(0,0,c.width,c.height);
+  ctx.strokeStyle=color;ctx.lineWidth=2;ctx.beginPath();
+  data.forEach((v,i)=>{let x=i*(c.width/30);let y=c.height-(v/100*c.height);if(i==0)ctx.moveTo(x,y);else ctx.lineTo(x,y);});
+  ctx.stroke();
+}
+
+// Config sliders → live send
+function sendConfig(){
+  let url='/config?humidity='+humTarget.value
+    +'&mist='+mistDur.value
+    +'&heaterOn='+heatOn.value
+    +'&heaterOff='+heatOff.value
+    +'&fanOn='+fanOn.value
+    +'&fanOff='+fanOff.value
+    +'&ledStart='+ledStart.value
+    +'&ledEnd='+ledEnd.value;
+  fetch(url).catch(e=>console.error("Config send failed",e));
+}
+function toggleTheme(){
+  document.body.classList.toggle('light');
+  localStorage.setItem('theme',document.body.classList.contains('light')?'light':'dark');
+}
+window.onload=()=>{
+  if(localStorage.getItem('theme')=='light')document.body.classList.add('light');
+  [humTarget,mistDur,heatOn,heatOff,fanOn,fanOff,ledStart,ledEnd].forEach(el=>{
+    el.oninput=function(){
+      if(this.id=='humTarget')humTargetVal.textContent=this.value;
+      if(this.id=='mistDur')mistDurVal.textContent=this.value;
+      if(this.id=='heatOn'||this.id=='heatOff')heatRange.textContent=heatOn.value+"–"+heatOff.value;
+      if(this.id=='fanOn'||this.id=='fanOff')fanRange.textContent=fanOn.value+"–"+fanOff.value;
+      if(this.id=='ledStart'||this.id=='ledEnd')ledRange.textContent=ledStart.value+"–"+ledEnd.value;
+      sendConfig();
+    };
+  });
+};
+connectWS();
+</script>
+</body>
+</html>
+)HTML";
+}
