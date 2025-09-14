@@ -1,0 +1,212 @@
+# 🌿 Paludarium Controller - WiFi Setup Manual
+
+## Quick Start Guide
+
+### What's in the Box
+- ✅ Paludarium Controller (ESP32-S3 based)
+- ✅ Power adapter
+- ✅ Sensor cables (DHT11, DS18B20, Water Level)
+- ✅ Relay connection cables
+- ✅ Quick start card
+
+---
+
+## 📱 Initial WiFi Setup (First Time Only)
+
+### Step 1: Power On Your Device
+1. Connect the power adapter to your Paludarium Controller
+2. Wait 30 seconds for the device to boot up
+3. Look for the **blue LED** to indicate setup mode is active
+
+### Step 2: Connect to Setup Network
+1. On your phone/tablet, go to **WiFi Settings**
+2. Look for the network named: **`Paludarium_Setup`**
+3. Connect to this network using password: **`paludarium`**
+4. Wait for connection confirmation
+
+### Step 3: Open Setup Interface
+1. Open your web browser (Safari, Chrome, Firefox, etc.)
+2. Go to: **`192.168.4.1`**
+3. You should see the "Paludarium WiFi Setup" page
+4. If the page doesn't load, try: **`http://192.168.4.1`**
+
+### Step 4: Scan for Your Network
+1. Click the **"🔄 Refresh Scan"** button
+2. Wait for the list of available networks to appear
+3. Find your home WiFi network in the list
+4. Click on your network name to select it
+
+### Step 5: Enter WiFi Password
+1. Your network name will appear in the "Network Name" field
+2. Enter your WiFi password in the "Password" field
+3. **Important**: Password is case-sensitive!
+4. Double-check spelling and capitalization
+
+### Step 6: Save & Connect
+1. Click **"💾 Save & Connect"**
+2. You'll see a confirmation message
+3. The device will automatically restart (takes ~30 seconds)
+4. The setup network will disappear
+
+### Step 7: Find Your Device
+1. Reconnect your phone to your home WiFi
+2. Find your device's new IP address using one of these methods:
+   - Check your router's admin page for "Paludarium" or "ESP32"
+   - Use a network scanner app (Fing, WiFi Analyzer)
+   - Check your router's DHCP client list
+
+---
+
+## 🎛️ Using Your Paludarium Controller
+
+### Accessing the Control Panel
+1. Open your web browser
+2. Go to your device's IP address (e.g., `192.168.1.100`)
+3. Bookmark this page for easy access!
+
+### Control Modes
+- **🤖 AUTO Mode**: Follows natural schedule (rain at 8am/8pm, etc.)
+- **📱 MANUAL Mode**: Full control via phone/tablet
+- **🔒 MANUAL LOCK**: Stays in manual mode until unlocked
+
+### Quick Controls
+- **Tap any button** to toggle devices on/off
+- **Hold button 1.5 seconds** to toggle manual lock
+- **Quick Actions**: Morning, Night, Mist Boost, Party Mode
+- **Live Settings**: Adjust temperature, humidity, timing in real-time
+
+---
+
+## 🔧 Troubleshooting
+
+### ❌ Can't Find "Paludarium_Setup" Network
+**Solutions:**
+- Wait 60 seconds after powering on
+- Perform factory reset (see below)
+- Make sure you're within 10 feet of the device
+- Refresh your phone's WiFi list
+
+### ❌ Setup Page Won't Load
+**Solutions:**
+- Try `http://192.168.4.1` (include "http://")
+- Disable mobile data/cellular
+- Try a different browser
+- Restart your phone's WiFi
+
+### ❌ "Connection Failed" After Entering Password
+**Solutions:**
+- Double-check WiFi password (case-sensitive!)
+- Make sure network is 2.4GHz (not 5GHz only)
+- Try moving device closer to router during setup
+- Check if network has special characters in name/password
+
+### ❌ Device Not Appearing on Home Network
+**Solutions:**
+- Wait 2-3 minutes for full connection
+- Check router logs for new devices
+- Restart your router
+- Perform factory reset and try again
+
+---
+
+## 🔄 Factory Reset
+
+### When to Factory Reset
+- Moving to a new location/network
+- WiFi password changed
+- Can't connect to device
+- Selling/giving away the device
+
+### How to Factory Reset
+1. **Power on** the device
+2. **Access the control panel** (if possible)
+3. **Hold any control button** for 10 seconds
+4. **Alternative**: Turn any device on via manual control and leave it running for 10 seconds
+5. Watch for confirmation in device logs
+6. Device will restart in setup mode
+
+---
+
+## 📋 Technical Specifications
+
+### WiFi Requirements
+- **Frequency**: 2.4GHz networks only
+- **Security**: WPA/WPA2/WPA3 supported
+- **Range**: Up to 50 meters from router
+- **Password**: Up to 63 characters
+
+### Browser Compatibility
+- ✅ Chrome (recommended)
+- ✅ Safari
+- ✅ Firefox
+- ✅ Edge
+- ✅ Mobile browsers
+
+### Network Features
+- **Auto-reconnect**: Reconnects if WiFi drops
+- **Static IP**: Can be configured in router
+- **Port forwarding**: Port 80 for remote access
+- **Multiple devices**: Each device needs separate setup
+
+---
+
+## 🆘 Support & Maintenance
+
+### Regular Maintenance
+- **Check connection**: Ensure device appears in router's device list
+- **Update networks**: Factory reset if changing WiFi networks
+- **Physical check**: Ensure antennas aren't damaged
+
+### Getting Help
+1. **Check this manual** for common solutions
+2. **Note error messages** exactly as displayed
+3. **Document your network setup** (router model, security type)
+4. **Try factory reset** before contacting support
+
+### Advanced Users
+- **Port 80**: Web interface
+- **Port 81**: WebSocket real-time data
+- **EEPROM**: WiFi credentials stored permanently
+- **OTA Updates**: Future firmware updates via web interface
+
+---
+
+## ✅ Success Checklist
+
+### After Setup, You Should Have:
+- [ ] Device connected to your home WiFi
+- [ ] Bookmarked the control panel URL
+- [ ] Tested manual controls work
+- [ ] Verified auto mode functions
+- [ ] Confirmed all sensors reading correctly
+
+### Your device is ready when:
+- [ ] Web interface loads instantly
+- [ ] Real-time data updates every 2 seconds
+- [ ] Manual controls respond immediately
+- [ ] Auto mode follows schedule properly
+- [ ] All sensor readings look normal
+
+---
+
+## 🌟 Pro Tips
+
+### For Best Performance
+- **Place near router**: Ensure strong WiFi signal
+- **Bookmark IP**: Save control panel address
+- **Use 2.4GHz**: Better range than 5GHz
+- **Regular checks**: Monitor connection monthly
+
+### Advanced Features
+- **Dark/Light themes**: Toggle in top-right corner
+- **Live graphs**: Watch sensor trends in real-time
+- **Manual lock**: Prevent auto-return for maintenance
+- **Quick actions**: One-tap macros for common tasks
+
+---
+
+**Need more help?** Check your device's IP address shows strong signal strength in your router's admin panel, or try the factory reset process to start fresh!
+
+---
+
+*Paludarium Controller v6.0 - Commercial WiFi Manager Edition*
