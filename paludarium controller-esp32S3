@@ -1,19 +1,8 @@
 /*
- * ESP32-S3 Paludarium Controller v5.2
- * ====================================
- * - Manual boot mode (default) with auto return after 30min
- * - Enhanced Auto Logic (natural rain/waterfall, humidity-driven mist, hysteresis heater/fan, sunrise/sunset LEDs)
- * - Manual Lock 🔒 option (no auto return until user unlocks)
- * - Configurable Device Enable/Disable system for all relays
- * - Professional Web UI:
- *     🌗 Dark/Light theme toggle
- *     🟢 System Health bar
- *     📈 Trend graphs (Temp, Humidity, Light)
- *     ⚡ Quick Actions (Morning, Night, Mist Boost, Party Mode)
- *     🎛️ Manual Lock/Unlock button
- *     ⚙️ Config sliders (live-sync: humidity, mist duration, heater/fan thresholds, LED window)
- *     🔧 Device Enable/Disable toggles
- * - Config values stored in RAM only
+ * ESP32-S3 Paludarium Controller v5.5 - OVERFLOW PROTECTION
+ * ==========================================================
+ * Complete biodome environmental control system with strict water level safety
+ * RAIN RULES: Emergency below 1000, Normal 1000-1900, NEVER above 2000
  */
 
 #include <DHT.h>
@@ -24,103 +13,114 @@
 #include <WebSocketsServer.h>
 #include <time.h>
 
-// ---------- WIFI ----------
-const char* WIFI_SSID = "CHANGE THIS FOR YOUR DETAILS";
-const char* WIFI_PASS = "CHANGE THIS FOR YOUR DETAILS/PASSWORD";
+// WiFi Settings
+const char* WIFI_SSID = "REPLACE WITH YOUR OWN";
+const char* WIFI_PASS = "REPLACE WITH YOUR OWN";
 
-// ---------- PINS ----------
-#define PIN_WATER_LEVEL  8
-#define PIN_LDR          6
-#define PIN_DHT          4
-#define DHT_TYPE         DHT11
-#define PIN_DS18B20      5
+// Pin Definitions
+#define PIN_WATER_LEVEL   8
+#define PIN_LDR           6
+#define PIN_DHT           4
+#define DHT_TYPE          DHT11
+#define PIN_DS18B20       5
+#define PIN_SOIL_MOISTURE 7
+#define RELAY_WATERFALL   12
+#define RELAY_RAIN        13
+#define RELAY_BUBBLE      14
+#define RELAY_FAN         15
+#define RELAY_HEATER      16
+#define RELAY_MIST        17
+#define RELAY_LED         18
 
-#define RELAY_WATERFALL  12
-#define RELAY_RAIN       13
-#define RELAY_BUBBLE     14
-#define RELAY_FAN        15
-#define RELAY_HEATER     16
-#define RELAY_MIST       17
-#define RELAY_LED        18
+// CRITICAL WATER LEVEL THRESHOLDS - OVERFLOW PROTECTION
+#define WATER_EMERGENCY_LOW  1000  // Emergency rain below this level
+#define WATER_OVERFLOW_STOP  2000  // ABSOLUTE MAX - NEVER rain above this
+#define WATER_LOW_THRESHOLD  1100  // General "low water" indicator
 
-// ---------- CONTROL MODE ----------
-#define AUTO_TIMEOUT_MS  (30UL * 60UL * 1000UL)  // 30 minutes
-bool manualMode = true;     // boot = MANUAL
-bool manualSticky = false;  // true = locked in manual
+// Other Thresholds
+#define SOIL_DRY_THRESHOLD   2000
+#define SOIL_WET_THRESHOLD   1000
+#define AUTO_TIMEOUT_MS      (30UL * 60UL * 1000UL)
+
+// Control Variables
+bool manualMode = true;
+bool manualSticky = false;
 unsigned long lastManualActivity = 0;
+bool rainAllowed = true;  // Rain permission based on water level
 
-// Manual overrides
 struct ManualState {
   bool rain = false, waterfall = false, bubble = false;
   bool mist = false, heater = false, fan = false, led = false;
 } manualOverride;
 
-// ---------- DEVICE ENABLE/DISABLE ----------
-struct DeviceEnabled {
-  bool rain = true;
-  bool waterfall = false;  // disabled by default
-  bool bubble = true;
-  bool mist = true;
-  bool heater = true;
-  bool fan = true;
-  bool led = true;
-} deviceEnabled;
-
-// ---------- CONFIG ----------
 struct Config {
   int humidityTarget = 70;
+  int humidityMax = 80;
+  int humidityFanOff = 75;
   int mistDuration = 10;
-  int heaterOn = 14;
-  int heaterOff = 30;
+  int heaterOn = 18;
+  int heaterOff = 28;
+  int waterHeaterOn = 18;
+  int waterHeaterOff = 28;
   int fanOn = 28;
-  int fanOff = 25;
+  int fanOff = 22;
   int ledDayStart = 8;
   int ledDayEnd = 20;
+  int soilMoistureTarget = 60;
+  int soilMoistureMin = 40;
+  int soilWateringDuration = 3;
 } config;
 
-// ---------- WATER SENSOR ----------
-#define WATER_LOW_THRESHOLD 1300
-
-// ---------- DRIVERS ----------
+// Hardware Objects
 DHT dht(PIN_DHT, DHT_TYPE);
 OneWire oneWire(PIN_DS18B20);
 DallasTemperature ds18b20(&oneWire);
 WebServer server(80);
 WebSocketsServer wsServer(81);
 
-// ---------- STATE ----------
+// Sensor Variables
 float humidity, ambientC, waterC;
-int ldr, waterLevel;
+int ldr, waterLevel, soilMoisture;
 bool waterOK = true;
 unsigned long lastRainTime = 0;
 unsigned long mistEnd = 0;
+unsigned long soilWateringEnd = 0;
 int ds18b20DeviceCount = 0;
 bool ds18b20Working = false;
+bool fanRunningForTemp = false;
+bool fanRunningForHumidity = false;
 
-// ---------- HELPERS ----------
-inline void relayOn(uint8_t pin){ digitalWrite(pin, LOW); }
-inline void relayOff(uint8_t pin){ digitalWrite(pin, HIGH); }
-inline bool relayState(uint8_t pin){ return digitalRead(pin)==LOW; }
+struct SystemThinking {
+  String nextRain = "";
+  String nextWaterfall = "";
+  String nextBubble = "";
+  String nextMist = "";
+  String nextHeater = "";
+  String nextFan = "";
+  String nextLED = "";
+  String nextSoil = "";
+  String reasoning = "";
+} thinking;
 
-// Enhanced relay control with enable/disable check
-void safeRelayOn(uint8_t pin, bool enabled) {
-  if (enabled) {
-    relayOn(pin);
-  } else {
-    relayOff(pin);
-  }
-}
+struct SerialOverride {
+  bool active = false;
+  String device = "";
+  String condition = "";
+  float targetValue = 0;
+  String targetType = "";
+  unsigned long startTime = 0;
+  unsigned long maxDuration = 0;
+} serialCmd;
 
-void safeRelayOff(uint8_t pin) {
-  relayOff(pin);
-}
-
-// ---------- TIME ----------
 struct tm timeinfo;
-void updateTime(){ getLocalTime(&timeinfo); }
 
-// ---------- DS18B20 ----------
-void initDS18B20(){
+// Helper Functions
+inline void relayOn(uint8_t pin) { digitalWrite(pin, LOW); }
+inline void relayOff(uint8_t pin) { digitalWrite(pin, HIGH); }
+inline bool relayState(uint8_t pin) { return digitalRead(pin) == LOW; }
+void updateTime() { getLocalTime(&timeinfo); }
+
+void initDS18B20() {
   ds18b20.begin();
   ds18b20.setResolution(12);
   ds18b20.setWaitForConversion(true);
@@ -129,140 +129,582 @@ void initDS18B20(){
   Serial.printf("DS18B20 devices found: %d\n", ds18b20DeviceCount);
 }
 
-// ---------- SENSORS ----------
-void readSensors(){
+void readSensors() {
   waterLevel = analogRead(PIN_WATER_LEVEL);
   waterOK = waterLevel > WATER_LOW_THRESHOLD;
+  
+  // CRITICAL OVERFLOW PROTECTION
+  if (waterLevel >= WATER_OVERFLOW_STOP) {
+    rainAllowed = false;  // NEVER rain at or above 2000
+    // Emergency stop any running rain
+    if (relayState(RELAY_RAIN)) {
+      relayOff(RELAY_RAIN);
+      Serial.println("EMERGENCY RAIN STOP - Water level at overflow limit!");
+    }
+  } else {
+    rainAllowed = true;   // Rain allowed below 2000
+  }
+  
+  soilMoisture = analogRead(PIN_SOIL_MOISTURE);
   humidity = dht.readHumidity();
   ambientC = dht.readTemperature();
-  if(ds18b20Working){
+  if(ds18b20Working) {
     ds18b20.requestTemperatures();
     waterC = ds18b20.getTempCByIndex(0);
-    if(waterC == DEVICE_DISCONNECTED_C || waterC < -55 || waterC > 125){
-      waterC = -999;
-    }
+    if(waterC == DEVICE_DISCONNECTED_C || waterC < -55 || waterC > 125) waterC = -999;
   } else waterC = -999;
   ldr = analogRead(PIN_LDR);
 }
 
-// ---------- MODE ----------
-void setManualActivity(){
-  lastManualActivity = millis();
-  if(!manualMode){
-    manualMode = true;
-    Serial.println("🎛️ MANUAL mode (user override)");
-  }
+int getSoilMoisturePercent() {
+  if(soilMoisture >= SOIL_DRY_THRESHOLD) return 0;
+  if(soilMoisture <= SOIL_WET_THRESHOLD) return 100;
+  int range = SOIL_DRY_THRESHOLD - SOIL_WET_THRESHOLD;
+  int reading = SOIL_DRY_THRESHOLD - soilMoisture;
+  return (reading * 100) / range;
 }
-void checkAutoReturn(){
-  if(manualMode && !manualSticky && (millis()-lastManualActivity > AUTO_TIMEOUT_MS)){
-    manualMode = false;
-    Serial.println("🤖 Auto-returned to AUTO mode");
+
+void setManualActivity() {
+  lastManualActivity = millis();
+  if(!manualMode) {
+    manualMode = true;
+    Serial.println("Manual mode activated");
   }
 }
 
-// ---------- AUTO LOGIC ----------
-void runAutoLogic(){
+void checkAutoReturn() {
+  if(manualMode && !manualSticky && (millis() - lastManualActivity > AUTO_TIMEOUT_MS)) {
+    manualMode = false;
+    Serial.println("Auto-returned to AUTO mode");
+  }
+}
+
+void processSerialCommand(String cmd) {
+  cmd.toLowerCase();
+  cmd.trim();
+  Serial.println("Command: " + cmd);
+  
+  if(cmd.startsWith("stop") || cmd.startsWith("clear")) {
+    serialCmd.active = false;
+    Serial.println("Serial override cleared");
+    return;
+  }
+  
+  if(cmd.indexOf(" until ") > 0) {
+    int untilPos = cmd.indexOf(" until ");
+    String device = cmd.substring(0, untilPos);
+    String condition = cmd.substring(untilPos + 7);
+    float value = 0;
+    String type = "";
+    
+    if(condition.indexOf("humidity") > 0) {
+      value = condition.substring(0, condition.indexOf(" ")).toFloat();
+      type = "humidity";
+    } else if(condition.indexOf("temp") > 0 || condition.indexOf("temperature") > 0) {
+      value = condition.substring(0, condition.indexOf(" ")).toFloat();
+      type = "temperature";
+    }
+    
+    if(value > 0 && type.length() > 0) {
+      serialCmd.active = true;
+      serialCmd.device = device;
+      serialCmd.condition = "until";
+      serialCmd.targetValue = value;
+      serialCmd.targetType = type;
+      serialCmd.startTime = millis();
+      serialCmd.maxDuration = 30UL * 60000UL;
+      Serial.println("Override: " + device + " until " + type + " reaches " + String(value));
+      setManualActivity();
+    } else {
+      Serial.println("Invalid condition format");
+    }
+  }
+  else if(cmd.indexOf(" for ") > 0) {
+    int forPos = cmd.indexOf(" for ");
+    String device = cmd.substring(0, forPos);
+    String duration = cmd.substring(forPos + 5);
+    float minutes = 0;
+    
+    if(duration.indexOf("min") > 0) {
+      minutes = duration.substring(0, duration.indexOf("min")).toFloat();
+    } else if(duration.indexOf("sec") > 0) {
+      minutes = duration.substring(0, duration.indexOf("sec")).toFloat() / 60.0;
+    }
+    
+    if(minutes > 0) {
+      serialCmd.active = true;
+      serialCmd.device = device;
+      serialCmd.condition = "duration";
+      serialCmd.maxDuration = minutes * 60000UL;
+      serialCmd.startTime = millis();
+      Serial.println("Override: " + device + " for " + String(minutes) + " minutes");
+      setManualActivity();
+    }
+  }
+  else if(cmd.indexOf(" on") >= 0 || cmd.indexOf(" off") >= 0) {
+    bool turnOn = cmd.indexOf(" on") >= 0;
+    String device = cmd;
+    device.replace(" on", "");
+    device.replace(" off", "");
+    
+    // RAIN SAFETY CHECK IN MANUAL MODE
+    if(device == "rain" && turnOn && waterLevel >= WATER_OVERFLOW_STOP) {
+      Serial.println("RAIN BLOCKED: Water level " + String(waterLevel) + " at overflow limit!");
+      return;
+    }
+    
+    setManualActivity();
+    if(device == "rain") manualOverride.rain = turnOn;
+    else if(device == "waterfall") manualOverride.waterfall = turnOn;
+    else if(device == "bubble" || device == "bubbles") manualOverride.bubble = turnOn;
+    else if(device == "mist") manualOverride.mist = turnOn;
+    else if(device == "heater" || device == "heat") manualOverride.heater = turnOn;
+    else if(device == "fan") manualOverride.fan = turnOn;
+    else if(device == "led" || device == "light") manualOverride.led = turnOn;
+    
+    Serial.println(device + " turned " + (turnOn ? "ON" : "OFF"));
+  }
+  else if(cmd == "auto" || cmd == "automatic") {
+    manualMode = false;
+    manualSticky = false;
+    serialCmd.active = false;
+    Serial.println("Switched to AUTO mode");
+  }
+  else if(cmd == "manual") {
+    manualMode = true;
+    manualSticky = true;
+    Serial.println("Switched to MANUAL mode (locked)");
+  }
+  else if(cmd == "status" || cmd == "info") {
+    Serial.println("=== STATUS ===");
+    Serial.println("Mode: " + String(manualMode ? "MANUAL" : "AUTO"));
+    Serial.println("Water Level: " + String(waterLevel) + " (Rain " + String(rainAllowed ? "ALLOWED" : "BLOCKED") + ")");
+    Serial.println("Humidity: " + String(humidity) + "%");
+    Serial.println("Air Temp: " + String(ambientC) + "C");
+    Serial.println("Water Temp: " + String(waterC) + "C");
+    Serial.println("Soil: " + String(getSoilMoisturePercent()) + "%");
+    Serial.println("Water: " + String(waterOK ? "GOOD" : "LOW"));
+    if(serialCmd.active) {
+      Serial.println("Override: " + serialCmd.device + " " + serialCmd.condition);
+    }
+  }
+  else if(cmd == "help") {
+    Serial.println("=== COMMANDS ===");
+    Serial.println("mist until 75 humidity");
+    Serial.println("fan until 25 temperature");
+    Serial.println("rain for 5 minutes");
+    Serial.println("heater on/off");
+    Serial.println("auto/manual");
+    Serial.println("status");
+    Serial.println("stop");
+    Serial.println("SAFETY: Rain blocked if water >= 2000");
+  }
+  else {
+    Serial.println("Unknown command. Type 'help'");
+  }
+}
+
+void checkSerialOverride() {
+  if(!serialCmd.active) return;
+  
+  unsigned long elapsed = millis() - serialCmd.startTime;
+  bool shouldStop = false;
+  String reason = "";
+  
+  if(elapsed > serialCmd.maxDuration) {
+    shouldStop = true;
+    reason = "timeout";
+  }
+  
+  if(serialCmd.condition == "until") {
+    if(serialCmd.targetType == "humidity" && !isnan(humidity)) {
+      if(serialCmd.device == "mist" && humidity >= serialCmd.targetValue) {
+        shouldStop = true;
+        reason = "humidity target reached";
+      }
+      else if(serialCmd.device == "fan" && humidity <= serialCmd.targetValue) {
+        shouldStop = true;
+        reason = "humidity target reached";
+      }
+    }
+    else if(serialCmd.targetType == "temperature" && !isnan(ambientC)) {
+      if(serialCmd.device == "heater" && ambientC >= serialCmd.targetValue) {
+        shouldStop = true;
+        reason = "temperature target reached";
+      }
+      else if(serialCmd.device == "fan" && ambientC <= serialCmd.targetValue) {
+        shouldStop = true;
+        reason = "temperature target reached";
+      }
+    }
+  }
+  else if(serialCmd.condition == "duration") {
+    if(elapsed >= serialCmd.maxDuration) {
+      shouldStop = true;
+      reason = "duration completed";
+    }
+  }
+  
+  if(shouldStop) {
+    Serial.println("Override stopped: " + reason);
+    serialCmd.active = false;
+    
+    if(serialCmd.device == "rain") manualOverride.rain = false;
+    else if(serialCmd.device == "waterfall") manualOverride.waterfall = false;
+    else if(serialCmd.device == "bubble") manualOverride.bubble = false;
+    else if(serialCmd.device == "mist") manualOverride.mist = false;
+    else if(serialCmd.device == "heater") manualOverride.heater = false;
+    else if(serialCmd.device == "fan") manualOverride.fan = false;
+    else if(serialCmd.device == "led") manualOverride.led = false;
+  }
+  else {
+    bool state = true;
+    if(serialCmd.device == "rain") manualOverride.rain = state;
+    else if(serialCmd.device == "waterfall") manualOverride.waterfall = state;
+    else if(serialCmd.device == "bubble") manualOverride.bubble = state;
+    else if(serialCmd.device == "mist") manualOverride.mist = state;
+    else if(serialCmd.device == "heater") manualOverride.heater = state;
+    else if(serialCmd.device == "fan") manualOverride.fan = state;
+    else if(serialCmd.device == "led") manualOverride.led = state;
+  }
+}
+
+void calculateAutoThinking() {
   unsigned long now = millis();
   int hour = timeinfo.tm_hour;
   int minute = timeinfo.tm_min;
+  
+  thinking.reasoning = "";
 
-  // Rain
+  // RAIN THINKING with water level safety
+  bool wouldRain = false;
+  String rainReason = "";
+  
+  if (waterLevel >= WATER_OVERFLOW_STOP) {
+    thinking.nextRain = "BLOCKED: Overflow protection (level " + String(waterLevel) + ")";
+    thinking.reasoning += "Rain BLOCKED: Water at overflow limit! ";
+  }
+  else if (waterLevel < WATER_EMERGENCY_LOW) {
+    thinking.nextRain = "Would run EMERGENCY (level " + String(waterLevel) + ")";
+    thinking.reasoning += "Would emergency rain: Water critically low. ";
+  }
+  else if (((hour==8 && minute<5)||(hour==20 && minute<5))) {
+    thinking.nextRain = "Would run scheduled (level " + String(waterLevel) + " safe)";
+    thinking.reasoning += "Would start rain: Scheduled time, water level safe. ";
+  } else {
+    if(hour < 8) thinking.nextRain = "Next: 08:00 (level " + String(waterLevel) + ")";
+    else if(hour < 20) thinking.nextRain = "Next: 20:00 (level " + String(waterLevel) + ")";
+    else thinking.nextRain = "Next: 08:00 tomorrow (level " + String(waterLevel) + ")";
+  }
+
+  thinking.nextWaterfall = "Would run 30min after rain stops";
+
+  if(hour>=8 && hour<22) {
+    unsigned long cycle=(now/60000UL)%60;
+    if(cycle<50) {
+      thinking.nextBubble = "Would be ON for " + String(50-cycle) + "min";
+    } else {
+      thinking.nextBubble = "Would be on break for " + String(60-cycle) + "min";
+    }
+  } else {
+    thinking.nextBubble = "Night mode - would resume at 08:00";
+  }
+
+  if(!isnan(humidity)) {
+    if(humidity < config.humidityTarget) {
+      thinking.nextMist = "Would start - humidity low";
+      thinking.reasoning += "Would start mist: Low humidity. ";
+    } else {
+      thinking.nextMist = "Humidity OK";
+    }
+  }
+
+  if(!isnan(ambientC) && ambientC < config.heaterOn) {
+    thinking.nextHeater = "Would heat air";
+    thinking.reasoning += "Would start heater: Air temp low. ";
+  }
+  if(waterC != -999 && waterC < config.waterHeaterOn) {
+    thinking.nextHeater = "Would heat water";
+    thinking.reasoning += "Would start heater: Water temp low. ";
+  }
+  if(thinking.nextHeater == "") thinking.nextHeater = "Temperature OK";
+
+  bool wouldRunTemp = (!isnan(ambientC) && ambientC > config.fanOn);
+  bool wouldRunHum = (!isnan(humidity) && humidity > config.humidityMax);
+  
+  if(wouldRunTemp || wouldRunHum) {
+    thinking.nextFan = "Would run for temp/humidity";
+    thinking.reasoning += "Would start fan. ";
+  } else {
+    thinking.nextFan = "Would start at limits";
+  }
+
+  if(hour>=config.ledDayStart && hour<config.ledDayEnd) {
+    thinking.nextLED = "Would be ON until " + String(config.ledDayEnd) + ":00";
+  } else {
+    thinking.nextLED = "Would turn on at " + String(config.ledDayStart) + ":00";
+  }
+
+  int soilPercent = getSoilMoisturePercent();
+  if(soilPercent < config.soilMoistureMin && rainAllowed) {
+    thinking.nextSoil = "Would water - soil dry";
+    thinking.reasoning += "Would water soil: Too dry. ";
+  } else if(soilPercent < config.soilMoistureMin && !rainAllowed) {
+    thinking.nextSoil = "Soil dry but water level too high!";
+    thinking.reasoning += "Soil needs water but level too high for safety! ";
+  } else {
+    thinking.nextSoil = "Soil OK (" + String(soilPercent) + "%)";
+  }
+
+  if(thinking.reasoning.length() == 0) {
+    thinking.reasoning = "All systems would be stable in AUTO mode.";
+  }
+}
+
+void runAutoLogic() {
+  unsigned long now = millis();
+  int hour = timeinfo.tm_hour;
+  int minute = timeinfo.tm_min;
+  
+  thinking.reasoning = "";
+
+  // ENHANCED RAIN CONTROL with absolute safety at 2000
   static unsigned long rainEnd = 0;
-  if(((hour==8 && minute<5)||(hour==20 && minute<5))||!waterOK){
-    safeRelayOn(RELAY_RAIN, deviceEnabled.rain);
+  bool shouldRain = false;
+  String rainReason = "";
+  
+  // ABSOLUTE SAFETY: Never rain at or above 2000
+  if (waterLevel >= WATER_OVERFLOW_STOP) {
+    shouldRain = false;
+    thinking.nextRain = "SAFETY BLOCK: Level " + String(waterLevel) + " (max 1999)";
+    thinking.reasoning += "Rain BLOCKED: Overflow protection! ";
+    // Emergency stop if somehow running
+    if (relayState(RELAY_RAIN)) {
+      relayOff(RELAY_RAIN);
+    }
+  }
+  // EMERGENCY: Always rain if critically low
+  else if (waterLevel < WATER_EMERGENCY_LOW) {
+    shouldRain = true;
+    rainReason = "EMERGENCY: Water critically low (" + String(waterLevel) + ")";
+  }
+  // NORMAL: Scheduled rain if water level allows
+  else if (((hour==8 && minute<5)||(hour==20 && minute<5))) {
+    shouldRain = true;
+    rainReason = "Scheduled (level " + String(waterLevel) + " safe)";
+  }
+  
+  if (shouldRain) {
+    relayOn(RELAY_RAIN);
     rainEnd = now + 5UL*60000UL;
     lastRainTime = now;
+    thinking.nextRain = "Running: " + rainReason;
+    thinking.reasoning += "Rain ON: " + rainReason + ". ";
+  } else {
+    relayOff(RELAY_RAIN);
+    
+    if (waterLevel >= WATER_OVERFLOW_STOP) {
+      thinking.nextRain = "SAFETY BLOCK: Level " + String(waterLevel) + " (max 1999)";
+    } else if (hour < 8) {
+      thinking.nextRain = "Next: 08:00 (level " + String(waterLevel) + " safe)";
+    } else if (hour < 20) {
+      thinking.nextRain = "Next: 20:00 (level " + String(waterLevel) + " safe)";
+    } else {
+      thinking.nextRain = "Next: 08:00 tomorrow (level " + String(waterLevel) + " safe)";
+    }
   }
-  if(now > rainEnd) safeRelayOff(RELAY_RAIN);
 
-  // Waterfall - only runs for 30 minutes after rain stops
+  // Soil moisture control with water level safety
+  int soilPercent = getSoilMoisturePercent();
+  static unsigned long soilCheck = 0;
+  if(now > soilCheck) {
+    soilCheck = now + 60000UL;
+    if(soilPercent < config.soilMoistureMin && waterOK && rainAllowed) {
+      soilWateringEnd = now + config.soilWateringDuration * 60000UL;
+      thinking.reasoning += "Soil watering: " + String(soilPercent) + "% too low. ";
+    } else if(soilPercent < config.soilMoistureMin && !rainAllowed) {
+      thinking.reasoning += "Soil dry but water level too high for safety! ";
+    }
+  }
+  
+  if(now < soilWateringEnd && waterOK && rainAllowed) {
+    if(!relayState(RELAY_RAIN)) relayOn(RELAY_RAIN);
+    thinking.nextSoil = "Watering for " + String((soilWateringEnd-now)/60000) + "min";
+  } else {
+    thinking.nextSoil = soilPercent >= config.soilMoistureTarget ? 
+      "Soil OK (" + String(soilPercent) + "%)" : 
+      (rainAllowed ? "Will water at " + String(config.soilMoistureMin) + "%" : 
+       "Soil dry but water level too high!");
+  }
+
+  // Waterfall control
   static unsigned long waterfallEnd = 0;
   static bool wasRaining = false;
   bool currentlyRaining = relayState(RELAY_RAIN);
 
-  // Detect when rain stops
   if(wasRaining && !currentlyRaining) {
-    waterfallEnd = now + 30UL * 60000UL; // 30 minutes from now
-    Serial.println("🌧️ Rain stopped - waterfall will run for 30 minutes");
+    waterfallEnd = now + 30UL * 60000UL;
+    thinking.reasoning += "Waterfall: Starting 30min cycle. ";
   }
   wasRaining = currentlyRaining;
 
-  // Control waterfall
   if(now < waterfallEnd) {
-    safeRelayOn(RELAY_WATERFALL, deviceEnabled.waterfall);
+    relayOn(RELAY_WATERFALL);
+    thinking.nextWaterfall = "Running for " + String((waterfallEnd-now)/60000) + "min";
   } else {
-    safeRelayOff(RELAY_WATERFALL);
+    relayOff(RELAY_WATERFALL);
+    thinking.nextWaterfall = "Waiting for rain to stop";
   }
 
-  // Bubbles
-  if(hour>=8 && hour<22){
+  // Bubble control
+  if(hour>=8 && hour<22) {
     unsigned long cycle=(now/60000UL)%60;
     if(cycle<50) {
-      safeRelayOn(RELAY_BUBBLE, deviceEnabled.bubble);
+      relayOn(RELAY_BUBBLE);
+      thinking.nextBubble = "ON for " + String(50-cycle) + "min";
     } else {
-      safeRelayOff(RELAY_BUBBLE);
+      relayOff(RELAY_BUBBLE);
+      thinking.nextBubble = "Break for " + String(60-cycle) + "min";
     }
-  } else safeRelayOff(RELAY_BUBBLE);
+  } else {
+    relayOff(RELAY_BUBBLE);
+    thinking.nextBubble = "Night mode";
+  }
 
-  // Mist
+  // Mist control
   static unsigned long mistCheck=0;
-  if(now>mistCheck){
+  if(now>mistCheck) {
     mistCheck=now+60000UL;
-    if((!isnan(humidity)&&humidity<config.humidityTarget)||(hour==12&&minute<5)||(hour==18&&minute<5)){
+    if((!isnan(humidity)&&humidity<config.humidityTarget)||(hour==12&&minute<5)||(hour==18&&minute<5)) {
       mistEnd=now+config.mistDuration*60000UL;
+      if(humidity<config.humidityTarget) thinking.reasoning += "Mist ON: Low humidity. ";
+      else thinking.reasoning += "Mist ON: Scheduled boost. ";
     }
   }
+  
   if(now<mistEnd) {
-    safeRelayOn(RELAY_MIST, deviceEnabled.mist);
+    relayOn(RELAY_MIST);
+    thinking.nextMist = "Running for " + String((mistEnd-now)/60000) + "min";
   } else {
-    safeRelayOff(RELAY_MIST);
-  }
-
-  // Heater
-  if(!isnan(ambientC)){
-    if(ambientC<config.heaterOn) {
-      safeRelayOn(RELAY_HEATER, deviceEnabled.heater);
-    } else if(ambientC>config.heaterOff) {
-      safeRelayOff(RELAY_HEATER);
+    relayOff(RELAY_MIST);
+    if(!isnan(humidity)) {
+      thinking.nextMist = humidity >= config.humidityTarget ? 
+        "Humidity OK" : "Will start soon";
+    } else {
+      thinking.nextMist = "Sensor error";
     }
   }
 
-  // Fan
-  if(!isnan(ambientC)){
-    if(ambientC>config.fanOn) {
-      safeRelayOn(RELAY_FAN, deviceEnabled.fan);
-    } else if(ambientC<config.fanOff) {
-      safeRelayOff(RELAY_FAN);
+  // Heater control
+  bool heaterShouldRun = false;
+  String heaterReason = "";
+  
+  bool heaterForAir = false;
+  if(!isnan(ambientC)) {
+    if(ambientC < config.heaterOn) {
+      heaterForAir = true;
+      heaterReason += "air " + String(ambientC,1) + "C low";
+    } else if(ambientC > config.heaterOff) {
+      heaterForAir = false;
     }
   }
+  
+  bool heaterForWater = false;
+  if(waterC != -999 && ds18b20Working) {
+    if(waterC < config.waterHeaterOn) {
+      heaterForWater = true;
+      if(heaterReason.length() > 0) heaterReason += " + ";
+      heaterReason += "water " + String(waterC,1) + "C low";
+    } else if(waterC > config.waterHeaterOff) {
+      heaterForWater = false;
+    }
+  }
+  
+  heaterShouldRun = heaterForAir || heaterForWater;
+  
+  if(heaterShouldRun) {
+    relayOn(RELAY_HEATER);
+    thinking.nextHeater = "Heating: " + heaterReason;
+    thinking.reasoning += "Heater ON: " + heaterReason + ". ";
+  } else {
+    relayOff(RELAY_HEATER);
+    thinking.nextHeater = "Temperature OK";
+  }
 
-  // LEDs
+  // Fan control
+  bool fanShouldRun = false;
+  String fanReason = "";
+  
+  if(!isnan(ambientC)) {
+    if(ambientC > config.fanOn) {
+      fanRunningForTemp = true;
+      fanReason += "temp " + String(ambientC,1) + "C high";
+    } else if(ambientC < config.fanOff) {
+      fanRunningForTemp = false;
+    }
+  }
+  
+  if(!isnan(humidity)) {
+    if(humidity > config.humidityMax) {
+      fanRunningForHumidity = true;
+      if(fanReason.length() > 0) fanReason += " + ";
+      fanReason += "humidity " + String(humidity,1) + "% high";
+    } else if(humidity < config.humidityFanOff) {
+      fanRunningForHumidity = false;
+    }
+  }
+  
+  fanShouldRun = fanRunningForTemp || fanRunningForHumidity;
+  
+  if(fanShouldRun) {
+    relayOn(RELAY_FAN);
+    thinking.nextFan = "ON: " + fanReason;
+    thinking.reasoning += "Fan ON: " + fanReason + ". ";
+  } else {
+    relayOff(RELAY_FAN);
+    thinking.nextFan = "Will start at limits";
+  }
+
+  // LED control
   if(hour>=config.ledDayStart && hour<config.ledDayEnd) {
-    safeRelayOn(RELAY_LED, deviceEnabled.led);
+    relayOn(RELAY_LED);
+    thinking.nextLED = "ON until " + String(config.ledDayEnd) + ":00";
   } else {
-    safeRelayOff(RELAY_LED);
+    relayOff(RELAY_LED);
+    thinking.nextLED = "Will turn on at " + String(config.ledDayStart) + ":00";
+  }
+
+  if(thinking.reasoning.length() == 0) {
+    thinking.reasoning = "All systems stable and within ranges.";
   }
 }
 
-// ---------- MANUAL LOGIC ----------
-void runManualLogic(){
-  if(manualOverride.rain && deviceEnabled.rain) relayOn(RELAY_RAIN); else relayOff(RELAY_RAIN);
-  if(manualOverride.waterfall && deviceEnabled.waterfall) relayOn(RELAY_WATERFALL); else relayOff(RELAY_WATERFALL);
-  if(manualOverride.bubble && deviceEnabled.bubble) relayOn(RELAY_BUBBLE); else relayOff(RELAY_BUBBLE);
-  if(manualOverride.mist && deviceEnabled.mist) relayOn(RELAY_MIST); else relayOff(RELAY_MIST);
-  if(manualOverride.heater && deviceEnabled.heater) relayOn(RELAY_HEATER); else relayOff(RELAY_HEATER);
-  if(manualOverride.fan && deviceEnabled.fan) relayOn(RELAY_FAN); else relayOff(RELAY_FAN);
-  if(manualOverride.led && deviceEnabled.led) relayOn(RELAY_LED); else relayOff(RELAY_LED);
+void runManualLogic() {
+  checkSerialOverride();
+  
+  // RAIN SAFETY CHECK - Override manual if water too high
+  if(manualOverride.rain && waterLevel >= WATER_OVERFLOW_STOP) {
+    manualOverride.rain = false;
+    Serial.println("MANUAL RAIN BLOCKED: Water at overflow limit!");
+  }
+  
+  if(manualOverride.rain) relayOn(RELAY_RAIN); else relayOff(RELAY_RAIN);
+  if(manualOverride.waterfall) relayOn(RELAY_WATERFALL); else relayOff(RELAY_WATERFALL);
+  if(manualOverride.bubble) relayOn(RELAY_BUBBLE); else relayOff(RELAY_BUBBLE);
+  if(manualOverride.mist) relayOn(RELAY_MIST); else relayOff(RELAY_MIST);
+  if(manualOverride.heater) relayOn(RELAY_HEATER); else relayOff(RELAY_HEATER);
+  if(manualOverride.fan) relayOn(RELAY_FAN); else relayOff(RELAY_FAN);
+  if(manualOverride.led) relayOn(RELAY_LED); else relayOff(RELAY_LED);
+  
+  calculateAutoThinking();
 }
 
-// ---------- LOGIC ----------
-void runLogic(){
+void runLogic() {
   checkAutoReturn();
-  manualMode?runManualLogic():runAutoLogic();
+  manualMode ? runManualLogic() : runAutoLogic();
 }
 
-// ---------- JSON ----------
-String buildJSON(){
+String buildJSON() {
   char timeBuf[32];
   strftime(timeBuf, sizeof(timeBuf), "%H:%M:%S", &timeinfo);
 
@@ -271,15 +713,17 @@ String buildJSON(){
   j += "\"mode\":\"" + String(manualMode ? "MANUAL" : "AUTO") + "\",";
   j += "\"sticky\":" + String(manualSticky ? "true" : "false") + ",";
   j += "\"autoIn\":" + String(manualMode ? (AUTO_TIMEOUT_MS - (millis() - lastManualActivity)) / 1000 : 0) + ",";
-
   j += "\"waterLevel\":" + String(waterLevel) + ",";
   j += "\"water\":\"" + String(waterOK ? "GOOD" : "LOW") + "\",";
+  j += "\"rainAllowed\":" + String(rainAllowed ? "true" : "false") + ",";
   j += "\"humidity\":" + String(isnan(humidity) ? -1 : humidity) + ",";
   j += "\"ambient\":" + String(isnan(ambientC) ? -1 : ambientC) + ",";
   j += "\"waterC\":" + String(waterC) + ",";
   j += "\"ds18b20Status\":\"" + String(ds18b20Working ? "OK" : "ERROR") + "\",";
   j += "\"ds18b20Count\":" + String(ds18b20DeviceCount) + ",";
   j += "\"ldr\":" + String(ldr) + ",";
+  j += "\"soilMoisture\":" + String(soilMoisture) + ",";
+  j += "\"soilMoisturePercent\":" + String(getSoilMoisturePercent()) + ",";
   j += "\"wf\":\"" + String(relayState(RELAY_WATERFALL) ? "ON" : "OFF") + "\",";
   j += "\"rain\":\"" + String(relayState(RELAY_RAIN) ? "ON" : "OFF") + "\",";
   j += "\"bubble\":\"" + String(relayState(RELAY_BUBBLE) ? "ON" : "OFF") + "\",";
@@ -287,423 +731,323 @@ String buildJSON(){
   j += "\"heat\":\"" + String(relayState(RELAY_HEATER) ? "ON" : "OFF") + "\",";
   j += "\"fan\":\"" + String(relayState(RELAY_FAN) ? "ON" : "OFF") + "\",";
   j += "\"led\":\"" + String(relayState(RELAY_LED) ? "ON" : "OFF") + "\",";
-
-  j += "\"enabled\":{";
-  j += "\"rain\":" + String(deviceEnabled.rain ? "true" : "false") + ",";
-  j += "\"waterfall\":" + String(deviceEnabled.waterfall ? "true" : "false") + ",";
-  j += "\"bubble\":" + String(deviceEnabled.bubble ? "true" : "false") + ",";
-  j += "\"mist\":" + String(deviceEnabled.mist ? "true" : "false") + ",";
-  j += "\"heater\":" + String(deviceEnabled.heater ? "true" : "false") + ",";
-  j += "\"fan\":" + String(deviceEnabled.fan ? "true" : "false") + ",";
-  j += "\"led\":" + String(deviceEnabled.led ? "true" : "false");
+  j += "\"thinking\":{";
+  j += "\"nextRain\":\"" + thinking.nextRain + "\",";
+  j += "\"nextWaterfall\":\"" + thinking.nextWaterfall + "\",";
+  j += "\"nextBubble\":\"" + thinking.nextBubble + "\",";
+  j += "\"nextMist\":\"" + thinking.nextMist + "\",";
+  j += "\"nextHeater\":\"" + thinking.nextHeater + "\",";
+  j += "\"nextFan\":\"" + thinking.nextFan + "\",";
+  j += "\"nextLED\":\"" + thinking.nextLED + "\",";
+  j += "\"nextSoil\":\"" + thinking.nextSoil + "\",";
+  j += "\"reasoning\":\"" + thinking.reasoning + "\"";
   j += "},";
-
   j += "\"config\":{";
   j += "\"humidityTarget\":" + String(config.humidityTarget) + ",";
+  j += "\"humidityMax\":" + String(config.humidityMax) + ",";
+  j += "\"humidityFanOff\":" + String(config.humidityFanOff) + ",";
   j += "\"mistDuration\":" + String(config.mistDuration) + ",";
   j += "\"heaterOn\":" + String(config.heaterOn) + ",";
   j += "\"heaterOff\":" + String(config.heaterOff) + ",";
+  j += "\"waterHeaterOn\":" + String(config.waterHeaterOn) + ",";
+  j += "\"waterHeaterOff\":" + String(config.waterHeaterOff) + ",";
   j += "\"fanOn\":" + String(config.fanOn) + ",";
   j += "\"fanOff\":" + String(config.fanOff) + ",";
   j += "\"ledDayStart\":" + String(config.ledDayStart) + ",";
-  j += "\"ledDayEnd\":" + String(config.ledDayEnd);
+  j += "\"ledDayEnd\":" + String(config.ledDayEnd) + ",";
+  j += "\"soilMoistureTarget\":" + String(config.soilMoistureTarget) + ",";
+  j += "\"soilMoistureMin\":" + String(config.soilMoistureMin) + ",";
+  j += "\"soilWateringDuration\":" + String(config.soilWateringDuration);
   j += "}}";
-
   return j;
 }
 
-// ---------- WEB HANDLERS ----------
-void handleControl(){
+void handleControl() {
   setManualActivity();
-  String d=server.arg("device"), s=server.arg("state");
-  bool on=(s=="on");
-  if(d=="rain") manualOverride.rain=on;
-  else if(d=="waterfall") manualOverride.waterfall=on;
-  else if(d=="bubble") manualOverride.bubble=on;
-  else if(d=="mist") manualOverride.mist=on;
-  else if(d=="heater") manualOverride.heater=on;
-  else if(d=="fan") manualOverride.fan=on;
-  else if(d=="led") manualOverride.led=on;
-  server.send(200,"text/plain","OK");
-}
-
-void handleEnable(){
-  String d=server.arg("device"), s=server.arg("state");
-  bool enabled=(s=="true");
-  if(d=="rain") deviceEnabled.rain=enabled;
-  else if(d=="waterfall") deviceEnabled.waterfall=enabled;
-  else if(d=="bubble") deviceEnabled.bubble=enabled;
-  else if(d=="mist") deviceEnabled.mist=enabled;
-  else if(d=="heater") deviceEnabled.heater=enabled;
-  else if(d=="fan") deviceEnabled.fan=enabled;
-  else if(d=="led") deviceEnabled.led=enabled;
+  String d = server.arg("device"), s = server.arg("state");
+  bool on = (s == "on");
   
-  // If device is disabled, turn it off immediately
-  if(!enabled) {
-    if(d=="rain") relayOff(RELAY_RAIN);
-    else if(d=="waterfall") relayOff(RELAY_WATERFALL);
-    else if(d=="bubble") relayOff(RELAY_BUBBLE);
-    else if(d=="mist") relayOff(RELAY_MIST);
-    else if(d=="heater") relayOff(RELAY_HEATER);
-    else if(d=="fan") relayOff(RELAY_FAN);
-    else if(d=="led") relayOff(RELAY_LED);
+  // RAIN SAFETY CHECK
+  if(d == "rain" && on && waterLevel >= WATER_OVERFLOW_STOP) {
+    server.send(400, "text/plain", "BLOCKED: Water at overflow limit!");
+    return;
   }
   
-  server.send(200,"text/plain","OK");
+  if(d == "rain") manualOverride.rain = on;
+  else if(d == "waterfall") manualOverride.waterfall = on;
+  else if(d == "bubble") manualOverride.bubble = on;
+  else if(d == "mist") manualOverride.mist = on;
+  else if(d == "heater") manualOverride.heater = on;
+  else if(d == "fan") manualOverride.fan = on;
+  else if(d == "led") manualOverride.led = on;
+  server.send(200, "text/plain", "OK");
 }
 
-void handleAutoMode(){ manualMode=false; manualSticky=false; server.send(200,"text/plain","AUTO"); }
-void handleManualLock(){ manualSticky=true; manualMode=true; server.send(200,"text/plain","LOCKED"); }
-void handleManualUnlock(){ manualSticky=false; server.send(200,"text/plain","UNLOCKED"); }
-void handleConfig(){
-  if(server.hasArg("humidity")) config.humidityTarget=server.arg("humidity").toInt();
-  if(server.hasArg("mist")) config.mistDuration=server.arg("mist").toInt();
-  if(server.hasArg("heaterOn")) config.heaterOn=server.arg("heaterOn").toInt();
-  if(server.hasArg("heaterOff")) config.heaterOff=server.arg("heaterOff").toInt();
-  if(server.hasArg("fanOn")) config.fanOn=server.arg("fanOn").toInt();
-  if(server.hasArg("fanOff")) config.fanOff=server.arg("fanOff").toInt();
-  if(server.hasArg("ledStart")) config.ledDayStart=server.arg("ledStart").toInt();
-  if(server.hasArg("ledEnd")) config.ledDayEnd=server.arg("ledEnd").toInt();
-  server.send(200,"text/plain","OK");
+void handleAutoMode() { 
+  manualMode = false; 
+  manualSticky = false; 
+  serialCmd.active = false;
+  server.send(200, "text/plain", "AUTO"); 
 }
 
-// ---------- WEB ----------
-String htmlIndex(); // defined below
+void handleManualLock() { 
+  manualSticky = true; 
+  manualMode = true; 
+  server.send(200, "text/plain", "LOCKED"); 
+}
 
-void setupWeb(){
-  server.on("/",HTTP_GET,[](){server.send(200,"text/html",htmlIndex());});
-  server.on("/status",HTTP_GET,[](){server.send(200,"application/json",buildJSON());});
-  server.on("/control",HTTP_GET,handleControl);
-  server.on("/enable",HTTP_GET,handleEnable);
-  server.on("/auto",HTTP_GET,handleAutoMode);
-  server.on("/manual/lock",HTTP_GET,handleManualLock);
-  server.on("/manual/unlock",HTTP_GET,handleManualUnlock);
-  server.on("/config",HTTP_GET,handleConfig);
+void handleManualUnlock() { 
+  manualSticky = false; 
+  server.send(200, "text/plain", "UNLOCKED"); 
+}
+
+void handleConfig() {
+  if(server.hasArg("humidity")) config.humidityTarget = server.arg("humidity").toInt();
+  if(server.hasArg("humMax")) config.humidityMax = server.arg("humMax").toInt();
+  if(server.hasArg("humFanOff")) config.humidityFanOff = server.arg("humFanOff").toInt();
+  if(server.hasArg("mist")) config.mistDuration = server.arg("mist").toInt();
+  if(server.hasArg("heaterOn")) config.heaterOn = server.arg("heaterOn").toInt();
+  if(server.hasArg("heaterOff")) config.heaterOff = server.arg("heaterOff").toInt();
+  if(server.hasArg("waterHeaterOn")) config.waterHeaterOn = server.arg("waterHeaterOn").toInt();
+  if(server.hasArg("waterHeaterOff")) config.waterHeaterOff = server.arg("waterHeaterOff").toInt();
+  if(server.hasArg("fanOn")) config.fanOn = server.arg("fanOn").toInt();
+  if(server.hasArg("fanOff")) config.fanOff = server.arg("fanOff").toInt();
+  if(server.hasArg("ledStart")) config.ledDayStart = server.arg("ledStart").toInt();
+  if(server.hasArg("ledEnd")) config.ledDayEnd = server.arg("ledEnd").toInt();
+  if(server.hasArg("soilTarget")) config.soilMoistureTarget = server.arg("soilTarget").toInt();
+  if(server.hasArg("soilMin")) config.soilMoistureMin = server.arg("soilMin").toInt();
+  if(server.hasArg("soilDuration")) config.soilWateringDuration = server.arg("soilDuration").toInt();
+  server.send(200, "text/plain", "OK");
+}
+
+void handleSerialCommand() {
+  if(server.hasArg("cmd")) {
+    String cmd = server.arg("cmd");
+    processSerialCommand(cmd);
+    server.send(200, "text/plain", "Command processed: " + cmd);
+  } else {
+    server.send(400, "text/plain", "No command provided");
+  }
+}
+
+String htmlIndex() {
+  return R"HTML(<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Paludarium Controller - Overflow Protection</title>
+<style>
+body {margin:0;padding:20px;font-family:'Arial',sans-serif;background:#0e1116;color:#eee;transition:background 0.3s,color 0.3s;}
+body.light{background:#f5f5f5;color:#222;}
+.container{max-width:960px;margin:auto;}
+h1{font-size:2em;margin:20px 0;text-align:center;}
+.topbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;}
+.themeToggle{padding:8px 14px;border:0;border-radius:8px;cursor:pointer;background:#333;color:#fff;}
+body.light .themeToggle{background:#ddd;color:#000;}
+.card{background:#1a1d23;border-radius:12px;padding:16px;margin:12px 0;box-shadow:0 2px 6px rgba(0,0,0,0.4);}
+body.light .card{background:#fff;color:#222;}
+.controls{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px;}
+.control{flex:1;min-width:110px;padding:10px;border-radius:8px;cursor:pointer;text-align:center;font-weight:600;}
+.control.on{background:#0fd36a;color:#000;}
+.control.off{background:#e05a5a;color:#fff;}
+.sensor{margin:6px 0;display:flex;justify-content:space-between;}
+.status.good{color:#0fd36a;font-weight:bold;}
+.status.bad{color:#e05a5a;font-weight:bold;}
+.status.warning{color:#ffcc00;font-weight:bold;}
+.health{font-weight:600;}
+.config-section{margin:12px 0;}
+.config-section label{display:block;margin:8px 0 4px 0;font-weight:500;}
+.config-section input[type="range"]{width:100%;margin:4px 0 8px 0;}
+.thinking-reason{background:#2a2d35;padding:12px;border-radius:8px;margin-bottom:12px;font-size:0.9em;line-height:1.4;border-left:4px solid #0fd36a;}
+body.light .thinking-reason{background:#f0f0f0;color:#333;}
+.thinking-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px;}
+.thinking-item{background:#2a2d35;padding:8px 12px;border-radius:6px;font-size:0.85em;border-left:3px solid #666;}
+body.light .thinking-item{background:#f8f8f8;color:#333;}
+.command-interface{display:flex;gap:8px;margin-bottom:12px;}
+.command-input{flex:1;padding:10px;border:1px solid #444;border-radius:6px;background:#2a2d35;color:#eee;font-size:14px;}
+body.light .command-input{background:#fff;color:#222;border-color:#ddd;}
+.command-send{padding:10px 20px;background:#0fd36a;color:#000;border:0;border-radius:6px;cursor:pointer;font-weight:600;}
+.command-examples{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px;}
+.example-btn{padding:6px 12px;background:#444;color:#eee;border:0;border-radius:4px;cursor:pointer;font-size:12px;}
+body.light .example-btn{background:#ddd;color:#222;}
+.serial-response{background:#1a1d23;padding:10px;border-radius:6px;font-family:monospace;font-size:13px;max-height:150px;overflow-y:auto;white-space:pre-wrap;min-height:40px;border:1px solid #333;}
+body.light .serial-response{background:#f9f9f9;color:#222;border-color:#ddd;}
+.safety-warning{background:#e05a5a;color:#fff;padding:12px;border-radius:8px;margin:12px 0;font-weight:600;text-align:center;}
+</style>
+</head>
+<body>
+<div class="container">
+<div class="topbar">
+<button class="themeToggle" onclick="toggleTheme()">🌗 Theme</button>
+<div id="health" class="health">System Health: --</div>
+</div>
+<h1>🌿 Paludarium Controller - Overflow Protection</h1>
+<div class="safety-warning">🚨 OVERFLOW PROTECTION: Rain blocked when water level ≥ 2000</div>
+<div id="status">Connecting...</div>
+<div class="card">
+<h3>💬 Serial Commands</h3>
+<div class="command-interface">
+<input type="text" id="serialInput" placeholder="Type command... (e.g., 'mist until 75 humidity')" class="command-input">
+<button onclick="sendSerialCommand()" class="command-send">Send</button>
+</div>
+<div class="command-examples">
+<button onclick="setCommand('mist until 75 humidity')" class="example-btn">Mist until 75%</button>
+<button onclick="setCommand('fan for 10 minutes')" class="example-btn">Fan 10min</button>
+<button onclick="setCommand('rain for 5 minutes')" class="example-btn">Rain 5min</button>
+<button onclick="setCommand('status')" class="example-btn">Status</button>
+<button onclick="setCommand('stop')" class="example-btn">Stop Override</button>
+</div>
+<div id="serialResponse" class="serial-response"></div>
+</div>
+<div id="dynamicContent"></div>
+<div class="card">
+<h3>⚙️ Auto Settings (Live)</h3>
+<div class="config-section">
+<label>Humidity Target (Mist ON): <span id="humTargetVal">70</span>%</label>
+<input type="range" id="humTarget" min="50" max="90" value="70">
+</div>
+<div class="config-section">
+<label>Humidity Max (Fan ON): <span id="humMaxVal">80</span>%</label>
+<input type="range" id="humMax" min="70" max="95" value="80">
+</div>
+<div class="config-section">
+<label>Humidity Fan OFF: <span id="humFanOffVal">75</span>%</label>
+<input type="range" id="humFanOff" min="60" max="85" value="75">
+</div>
+<div class="config-section">
+<label>Mist Duration: <span id="mistDurVal">10</span> min</label>
+<input type="range" id="mistDur" min="1" max="20" value="10">
+</div>
+<div class="config-section">
+<label>Heater Air On/Off: <span id="heatRange">14–30</span> °C</label>
+<input type="range" id="heatOn" min="10" max="35" value="14">
+<input type="range" id="heatOff" min="10" max="35" value="30">
+</div>
+<div class="config-section">
+<label>Heater Water On/Off: <span id="waterHeatRange">18–22</span> °C</label>
+<input type="range" id="waterHeatOn" min="10" max="35" value="18">
+<input type="range" id="waterHeatOff" min="10" max="35" value="22">
+</div>
+<div class="config-section">
+<label>Fan Temp On/Off: <span id="fanRange">28–25</span> °C</label>
+<input type="range" id="fanOn" min="10" max="35" value="28">
+<input type="range" id="fanOff" min="10" max="35" value="25">
+</div>
+<div class="config-section">
+<label>LED Daytime: <span id="ledRange">08–20</span> h</label>
+<input type="range" id="ledStart" min="0" max="23" value="8">
+<input type="range" id="ledEnd" min="0" max="23" value="20">
+</div>
+<div class="config-section">
+<label>Soil Moisture Target: <span id="soilTargetVal">60</span>%</label>
+<input type="range" id="soilTarget" min="30" max="90" value="60">
+</div>
+<div class="config-section">
+<label>Soil Water When Below: <span id="soilMinVal">40</span>%</label>
+<input type="range" id="soilMin" min="20" max="70" value="40">
+</div>
+<div class="config-section">
+<label>Soil Watering Duration: <span id="soilDurationVal">3</span> min</label>
+<input type="range" id="soilDuration" min="1" max="15" value="3">
+</div>
+</div>
+</div>
+<script>
+let ws,pressTimer=null;
+window.currentSticky=false;
+function connectWS(){ws=new WebSocket("ws://"+location.host+":81/");ws.onopen=()=>console.log("Connected");ws.onclose=()=>setTimeout(connectWS,1500);ws.onmessage=(ev)=>{try{render(JSON.parse(ev.data));}catch(e){}};}
+function control(device,state){fetch('/control?device='+device+'&state='+state).then(response=>response.text()).then(result=>{if(result.includes("BLOCKED")){alert("RAIN BLOCKED: Water level at overflow limit!");}}).catch(e=>console.error(e));}
+function autoMode(){fetch('/auto');}
+function controlPressStart(dev,state){pressTimer=setTimeout(()=>{if(confirm("Toggle Manual Lock?")){fetch('/manual/'+(window.currentSticky?'unlock':'lock'));}},1500);}
+function controlPressEnd(dev,state){if(pressTimer){clearTimeout(pressTimer);pressTimer=null;control(dev,state);}}
+function render(j){window.currentSticky=j.sticky;let autoTime=j.mode=='MANUAL'?Math.floor(j.autoIn/60)+':'+(j.autoIn%60).toString().padStart(2,'0'):'';let manualLabel='📱 MANUAL MODE';if(j.sticky)manualLabel+=' 🔒';if(autoTime&&!j.sticky)manualLabel+=' ('+autoTime+' to auto)';let modeLine=(j.mode=='AUTO'?'🤖 AUTO MODE':manualLabel);document.getElementById('status').innerHTML='<div class="mode">'+modeLine+'</div>';let rainStatus=j.rainAllowed?'ALLOWED':'BLOCKED';let rainClass=j.rainAllowed?'good':'bad';document.getElementById('dynamicContent').innerHTML='<div class="card"><h3>📊 Sensors</h3>'+'<div class="sensor">🕒 Time<strong>'+j.time+'</strong></div>'+'<div class="sensor">💧 Water Level<strong>'+j.waterLevel+'</strong><span class="status '+(j.water=='GOOD'?'good':'bad')+'">'+j.water+'</span></div>'+'<div class="sensor">🌧️ Rain Permission<strong>'+rainStatus+'</strong><span class="status '+rainClass+'">Max: 1999</span></div>'+'<div class="sensor">🌊 Water Temp<strong>'+(j.waterC==-999?'ERROR':j.waterC.toFixed(1)+'°C')+'</strong><span class="status '+(j.ds18b20Status=='OK'?'good':'warning')+'">DS18B20: '+j.ds18b20Status+'</span></div>'+'<div class="sensor">💨 Humidity<strong>'+(j.humidity==-1?'ERROR':j.humidity.toFixed(1)+'%')+'</strong></div>'+'<div class="sensor">🌡️ Air<strong>'+(j.ambient==-1?'ERROR':j.ambient.toFixed(1)+'°C')+'</strong></div>'+'<div class="sensor">🌱 Soil Moisture<strong>'+j.soilMoisturePercent+'%</strong><span class="status '+(j.soilMoisturePercent>=40?'good':(j.soilMoisturePercent>=20?'warning':'bad'))+'">Raw: '+j.soilMoisture+'</span></div>'+'<div class="sensor">☀️ Light<strong>'+j.ldr+'</strong></div>'+'</div>'+(j.mode=='AUTO'?'<div class="card"><h3>🧠 System Thinking</h3>'+'<div class="thinking-reason">'+j.thinking.reasoning+'</div>'+'<div class="thinking-grid">'+'<div class="thinking-item">🌧️ Rain: '+j.thinking.nextRain+'</div>'+'<div class="thinking-item">🏔️ Waterfall: '+j.thinking.nextWaterfall+'</div>'+'<div class="thinking-item">🫧 Bubbles: '+j.thinking.nextBubble+'</div>'+'<div class="thinking-item">🌫️ Mist: '+j.thinking.nextMist+'</div>'+'<div class="thinking-item">🔥 Heater: '+j.thinking.nextHeater+'</div>'+'<div class="thinking-item">🌀 Fan: '+j.thinking.nextFan+'</div>'+'<div class="thinking-item">🌱 Soil: '+j.thinking.nextSoil+'</div>'+'<div class="thinking-item">💡 LED: '+j.thinking.nextLED+'</div>'+'</div></div>':'<div class="card"><h3>🔮 Auto Preview</h3>'+'<div class="thinking-reason">'+j.thinking.reasoning+'</div>'+'<div class="thinking-grid">'+'<div class="thinking-item">🌧️ Rain: '+j.thinking.nextRain+'</div>'+'<div class="thinking-item">🏔️ Waterfall: '+j.thinking.nextWaterfall+'</div>'+'<div class="thinking-item">🫧 Bubbles: '+j.thinking.nextBubble+'</div>'+'<div class="thinking-item">🌫️ Mist: '+j.thinking.nextMist+'</div>'+'<div class="thinking-item">🔥 Heater: '+j.thinking.nextHeater+'</div>'+'<div class="thinking-item">🌀 Fan: '+j.thinking.nextFan+'</div>'+'<div class="thinking-item">🌱 Soil: '+j.thinking.nextSoil+'</div>'+'<div class="thinking-item">💡 LED: '+j.thinking.nextLED+'</div>'+'</div></div>')+'<div class="card"><h3>🎛️ Controls</h3><div class="controls">'+buttonHTML('rain','🌧️ Rain',j.rain,j.rainAllowed)+buttonHTML('waterfall','🏔️ Waterfall',j.wf,true)+buttonHTML('bubble','🫧 Bubbles',j.bubble,true)+buttonHTML('mist','🌫️ Mist',j.mist,true)+buttonHTML('heater','🔥 Heater',j.heat,true)+buttonHTML('fan','🌀 Fan',j.fan,true)+buttonHTML('led','💡 LEDs',j.led,true)+'<button class="control off" onclick="autoMode()" style="background:#666;color:#fff;">🤖 Return to Auto</button>'+'</div></div>'+'<div class="card"><h3>⚡ Quick Actions</h3><div class="controls">'+'<button class="control on" onclick="macroMorning()">🌅 Morning</button>'+'<button class="control off" onclick="macroNight()">🌙 Night</button>'+'<button class="control on" onclick="macroMist()">💨 Mist Boost</button>'+'<button class="control off" onclick="partyMode()">🎉 Party</button>'+'</div></div>';document.getElementById('health').textContent='Water: '+j.waterLevel+' | Rain: '+rainStatus+' | DS18B20: '+j.ds18b20Status;humTarget.value=j.config.humidityTarget;humTargetVal.textContent=j.config.humidityTarget;humMax.value=j.config.humidityMax;humMaxVal.textContent=j.config.humidityMax;humFanOff.value=j.config.humidityFanOff;humFanOffVal.textContent=j.config.humidityFanOff;mistDur.value=j.config.mistDuration;mistDurVal.textContent=j.config.mistDuration;heatOn.value=j.config.heaterOn;heatOff.value=j.config.heaterOff;heatRange.textContent=heatOn.value+"–"+heatOff.value;waterHeatOn.value=j.config.waterHeaterOn;waterHeatOff.value=j.config.waterHeaterOff;waterHeatRange.textContent=waterHeatOn.value+"–"+waterHeatOff.value;fanOn.value=j.config.fanOn;fanOff.value=j.config.fanOff;fanRange.textContent=fanOn.value+"–"+fanOff.value;ledStart.value=j.config.ledDayStart;ledEnd.value=j.config.ledDayEnd;ledRange.textContent=ledStart.value+"–"+ledEnd.value;soilTarget.value=j.config.soilMoistureTarget;soilTargetVal.textContent=j.config.soilMoistureTarget;soilMin.value=j.config.soilMoistureMin;soilMinVal.textContent=j.config.soilMoistureMin;soilDuration.value=j.config.soilWateringDuration;soilDurationVal.textContent=j.config.soilWateringDuration;}
+function buttonHTML(dev,label,state,allowed){let disabled=!allowed?' disabled':'';let style=!allowed?' style="opacity:0.5;cursor:not-allowed;"':'';return'<button class="control '+(state=='ON'?'on':'off')+'"'+disabled+style+' '+'onmousedown="controlPressStart(\''+dev+'\',\''+(state=='ON'?'off':'on')+'\')" '+'onmouseup="controlPressEnd(\''+dev+'\',\''+(state=='ON'?'off':'on')+'\')" '+'ontouchstart="controlPressStart(\''+dev+'\',\''+(state=='ON'?'off':'on')+'\')" '+'ontouchend="controlPressEnd(\''+dev+'\',\''+(state=='ON'?'off':'on')+'\')">'+ label+' '+state+(dev=='rain'&&!allowed?' (BLOCKED)':'')+'</button>';}
+function macroMorning(){control('rain','on');setTimeout(()=>control('rain','off'),5000);control('led','on');}
+function macroNight(){['led','fan','heater','mist'].forEach(d=>control(d,'off'));}
+function macroMist(){control('mist','on');setTimeout(()=>control('mist','off'),300000);}
+function partyMode(){['rain','waterfall','bubble','mist','heater','fan','led'].forEach(d=>control(d,'on'));setTimeout(()=>['rain','waterfall','bubble','mist','heater','fan','led'].forEach(d=>control(d,'off')),30000);}
+function setCommand(cmd){document.getElementById('serialInput').value=cmd;}
+function sendSerialCommand(){let cmd=document.getElementById('serialInput').value.trim();if(!cmd)return;fetch('/serial?cmd='+encodeURIComponent(cmd)).then(response=>response.text()).then(result=>{let responseDiv=document.getElementById('serialResponse');let timestamp=new Date().toLocaleTimeString();responseDiv.textContent+='['+timestamp+'] > '+cmd+'\n'+result+'\n\n';responseDiv.scrollTop=responseDiv.scrollHeight;document.getElementById('serialInput').value='';}).catch(error=>{let responseDiv=document.getElementById('serialResponse');responseDiv.textContent+='Error: '+error+'\n\n';});}
+function sendConfig(){let url='/config?humidity='+humTarget.value+'&humMax='+humMax.value+'&humFanOff='+humFanOff.value+'&mist='+mistDur.value+'&heaterOn='+heatOn.value+'&heaterOff='+heatOff.value+'&waterHeaterOn='+waterHeatOn.value+'&waterHeaterOff='+waterHeatOff.value+'&fanOn='+fanOn.value+'&fanOff='+fanOff.value+'&ledStart='+ledStart.value+'&ledEnd='+ledEnd.value+'&soilTarget='+soilTarget.value+'&soilMin='+soilMin.value+'&soilDuration='+soilDuration.value;fetch(url).catch(e=>console.error("Config send failed",e));}
+function toggleTheme(){document.body.classList.toggle('light');localStorage.setItem('theme',document.body.classList.contains('light')?'light':'dark');}
+window.onload=()=>{if(localStorage.getItem('theme')=='light')document.body.classList.add('light');[humTarget,humMax,humFanOff,mistDur,heatOn,heatOff,waterHeatOn,waterHeatOff,fanOn,fanOff,ledStart,ledEnd,soilTarget,soilMin,soilDuration].forEach(el=>{el.oninput=function(){if(this.id=='humTarget')humTargetVal.textContent=this.value;if(this.id=='humMax')humMaxVal.textContent=this.value;if(this.id=='humFanOff')humFanOffVal.textContent=this.value;if(this.id=='mistDur')mistDurVal.textContent=this.value;if(this.id=='heatOn'||this.id=='heatOff')heatRange.textContent=heatOn.value+"–"+heatOff.value;if(this.id=='waterHeatOn'||this.id=='waterHeatOff')waterHeatRange.textContent=waterHeatOn.value+"–"+waterHeatOff.value;if(this.id=='fanOn'||this.id=='fanOff')fanRange.textContent=fanOn.value+"–"+fanOff.value;if(this.id=='ledStart'||this.id=='ledEnd')ledRange.textContent=ledStart.value+"–"+ledEnd.value;if(this.id=='soilTarget')soilTargetVal.textContent=this.value;if(this.id=='soilMin')soilMinVal.textContent=this.value;if(this.id=='soilDuration')soilDurationVal.textContent=this.value;sendConfig();};});document.getElementById('serialInput').addEventListener('keypress',function(e){if(e.key==='Enter')sendSerialCommand();});};
+connectWS();
+</script>
+</body>
+</html>)HTML";
+}
+
+void setupWeb() {
+  server.on("/", HTTP_GET, []() { server.send(200, "text/html", htmlIndex()); });
+  server.on("/status", HTTP_GET, []() { server.send(200, "application/json", buildJSON()); });
+  server.on("/control", HTTP_GET, handleControl);
+  server.on("/auto", HTTP_GET, handleAutoMode);
+  server.on("/manual/lock", HTTP_GET, handleManualLock);
+  server.on("/manual/unlock", HTTP_GET, handleManualUnlock);
+  server.on("/config", HTTP_GET, handleConfig);
+  server.on("/serial", HTTP_GET, handleSerialCommand);
+  
   server.begin();
   wsServer.begin();
-  wsServer.onEvent([](uint8_t num,WStype_t type,uint8_t* payload,size_t length){
-    if(type==WStype_CONNECTED) {
+  wsServer.onEvent([](uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
+    if(type == WStype_CONNECTED) {
       String msg = buildJSON();   
       wsServer.sendTXT(num, msg);
     }
   });
 }
 
-// ---------- SETUP ----------
-void setup(){
+void setup() {
   Serial.begin(115200);
-  dht.begin(); initDS18B20();
-  pinMode(PIN_WATER_LEVEL,INPUT); pinMode(PIN_LDR,INPUT);
-  int relays[]={RELAY_WATERFALL,RELAY_RAIN,RELAY_BUBBLE,RELAY_FAN,RELAY_HEATER,RELAY_MIST,RELAY_LED};
-  for(int p:relays){pinMode(p,OUTPUT);relayOff(p);}
-  WiFi.begin(WIFI_SSID,WIFI_PASS);
-  while(WiFi.status()!=WL_CONNECTED){delay(500);Serial.print(".");}
-  Serial.println("\n✅ WiFi Connected! IP: "+WiFi.localIP().toString());
-  configTime(0,0,"pool.ntp.org","time.nist.gov"); updateTime();
+  dht.begin();
+  initDS18B20();
+  
+  pinMode(PIN_WATER_LEVEL, INPUT);
+  pinMode(PIN_LDR, INPUT);
+  pinMode(PIN_SOIL_MOISTURE, INPUT);
+  
+  int relays[] = {RELAY_WATERFALL, RELAY_RAIN, RELAY_BUBBLE, RELAY_FAN, RELAY_HEATER, RELAY_MIST, RELAY_LED};
+  for(int pin : relays) {
+    pinMode(pin, OUTPUT);
+    relayOff(pin);
+  }
+  
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  while(WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi Connected! IP: " + WiFi.localIP().toString());
+  
+  configTime(0, 3600, "pool.ntp.org", "time.nist.gov");
+  updateTime();
   setupWeb();
-  Serial.println("🌐 Web server ready");
-  Serial.println("📊 Controller initialized");
-  Serial.println("🔧 Device Enable Status:");
-  Serial.printf("  Rain: %s\n", deviceEnabled.rain ? "ENABLED" : "DISABLED");
-  Serial.printf("  Waterfall: %s\n", deviceEnabled.waterfall ? "ENABLED" : "DISABLED");
-  Serial.printf("  Bubble: %s\n", deviceEnabled.bubble ? "ENABLED" : "DISABLED");
-  Serial.printf("  Mist: %s\n", deviceEnabled.mist ? "ENABLED" : "DISABLED");
-  Serial.printf("  Heater: %s\n", deviceEnabled.heater ? "ENABLED" : "DISABLED");
-  Serial.printf("  Fan: %s\n", deviceEnabled.fan ? "ENABLED" : "DISABLED");
-  Serial.printf("  LED: %s\n", deviceEnabled.led ? "ENABLED" : "DISABLED");
+  
+  Serial.println("=== PALUDARIUM CONTROLLER READY - OVERFLOW PROTECTION ===");
+  Serial.println("Web server ready");
+  Serial.println("SAFETY: Rain NEVER allowed at water level >= 2000");
+  Serial.println("EMERGENCY: Rain forced ON if water level < 1000");
+  Serial.println("NORMAL: Scheduled rain 8:00 & 20:00 if water level < 2000");
+  Serial.println("Serial commands ready! Type 'help'");
 }
 
-// ---------- LOOP ----------
-void loop(){
-  server.handleClient(); 
+void loop() {
+  server.handleClient();
   wsServer.loop();
-  static unsigned long last=0;
-  if(millis()-last>2000){
-    last=millis(); 
-    updateTime(); 
-    readSensors(); 
+  
+  if(Serial.available()) {
+    String command = Serial.readStringUntil('\n');
+    processSerialCommand(command);
+  }
+  
+  static unsigned long lastUpdate = 0;
+  if(millis() - lastUpdate > 2000) {
+    lastUpdate = millis();
+    updateTime();
+    readSensors();
     runLogic();
-    String msg = buildJSON();   
+    String msg = buildJSON();
     wsServer.broadcastTXT(msg);
   }
-}
-
-// ---------- WEB UI ----------
-String htmlIndex() {
-  return R"HTML(
-<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Paludarium Controller</title>
-<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700&family=Inter:wght@400;600&display=swap" rel="stylesheet">
-<style>
-body {
-  margin:0; padding:20px;
-  font-family: 'Inter', sans-serif;
-  background:#0e1116; color:#eee;
-  transition: background 0.3s, color 0.3s;
-}
-body.light { background:#f5f5f5; color:#222; }
-
-.container { max-width:960px; margin:auto; }
-h1 { font-family:'Orbitron', sans-serif; font-size:2em; margin:20px 0; }
-
-.topbar { display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; }
-.themeToggle { padding:8px 14px; border:0; border-radius:8px; cursor:pointer; background:#333; color:#fff; }
-body.light .themeToggle { background:#ddd; color:#000; }
-
-.card {
-  background:#1a1d23; border-radius:12px; padding:16px; margin:12px 0;
-  box-shadow:0 2px 6px rgba(0,0,0,0.4);
-}
-body.light .card { background:#fff; color:#222; }
-
-.controls { display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }
-.control {
-  flex:1; min-width:110px;
-  padding:10px; border-radius:8px; cursor:pointer;
-  text-align:center; font-weight:600;
-}
-.control.on { background:#0fd36a; color:#000; }
-.control.off { background:#e05a5a; color:#fff; }
-.control.disabled { background:#666; color:#999; cursor:not-allowed; opacity:0.5; }
-
-.enable-controls { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:10px; margin:10px 0; }
-.enable-item { display:flex; justify-content:space-between; align-items:center; padding:8px; background:#333; border-radius:6px; }
-body.light .enable-item { background:#f0f0f0; }
-.enable-toggle { position:relative; width:50px; height:24px; background:#666; border-radius:12px; cursor:pointer; transition:background 0.3s; }
-.enable-toggle.enabled { background:#0fd36a; }
-.enable-toggle::after { content:''; position:absolute; top:2px; left:2px; width:20px; height:20px; background:#fff; border-radius:50%; transition:left 0.3s; }
-.enable-toggle.enabled::after { left:28px; }
-
-.sensor { margin:6px 0; display:flex; justify-content:space-between; }
-.status.good { color:#0fd36a; font-weight:bold; }
-.status.bad { color:#e05a5a; font-weight:bold; }
-.status.warning { color:#ffcc00; font-weight:bold; }
-
-.graphs { display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:10px; }
-canvas { width:100%; height:150px; background:#000; border-radius:6px; }
-
-.health { font-weight:600; }
-</style>
-</head>
-<body>
-<div class="container">
-  <div class="topbar">
-    <button class="themeToggle" onclick="toggleTheme()">🌗 Theme</button>
-    <div id="health" class="health">System Health: --</div>
-  </div>
-  <h1>🌿 Paludarium</h1>
-  <div id="status">Connecting...</div>
-
-  <div class="card"><h3>📈 Trends</h3>
-    <div class="graphs">
-      <div class="graph"><canvas id="tempGraph" width="300" height="150"></canvas></div>
-      <div class="graph"><canvas id="humGraph" width="300" height="150"></canvas></div>
-      <div class="graph"><canvas id="lightGraph" width="300" height="150"></canvas></div>
-    </div>
-  </div>
-
-  <div class="card">
-    <h3>🔧 Device Enable/Disable</h3>
-    <div class="enable-controls" id="enableControls">
-      <!-- Populated by JavaScript -->
-    </div>
-  </div>
-
-  <div id="dynamicContent"></div>
-
-  <div class="card">
-    <h3>⚙️ Auto Settings (Live)</h3>
-    <label>Humidity Target: <span id="humTargetVal">70</span>%</label>
-    <input type="range" id="humTarget" min="50" max="90" value="70">
-    <label>Mist Duration: <span id="mistDurVal">10</span> min</label>
-    <input type="range" id="mistDur" min="1" max="20" value="10">
-    <label>Heater On/Off: <span id="heatRange">18–21</span> °C</label>
-    <input type="range" id="heatOn" min="10" max="25" value="18">
-    <input type="range" id="heatOff" min="15" max="30" value="21">
-    <label>Fan On/Off: <span id="fanRange">28–25</span> °C</label>
-    <input type="range" id="fanOn" min="25" max="40" value="28">
-    <input type="range" id="fanOff" min="20" max="30" value="25">
-    <label>LED Daytime: <span id="ledRange">08–20</span> h</label>
-    <input type="range" id="ledStart" min="0" max="23" value="8">
-    <input type="range" id="ledEnd" min="0" max="23" value="20">
-  </div>
-</div>
-
-<script>
-let ws; let historyTemp=[],historyHum=[],historyLight=[];
-let pressTimer=null; // long press timer
-window.currentSticky=false;
-window.currentEnabled={};
-
-function connectWS(){
-  ws=new WebSocket("ws://"+location.host+":81/");
-  ws.onopen=()=>console.log("✅ Connected");
-  ws.onclose=()=>setTimeout(connectWS,1500);
-  ws.onmessage=(ev)=>{try{render(JSON.parse(ev.data));}catch(e){}};
-}
-function control(device,state){ fetch('/control?device='+device+'&state='+state); }
-function toggleEnable(device){ 
-  let newState = !window.currentEnabled[device];
-  fetch('/enable?device='+device+'&state='+newState); 
-}
-function autoMode(){ fetch('/auto'); }
-
-// Long press handlers
-function controlPressStart(dev,state){
-  pressTimer=setTimeout(()=>{
-    if(confirm("Toggle Manual Lock?")){
-      fetch('/manual/'+(window.currentSticky ? 'unlock':'lock'));
-    }
-  },1500);
-}
-function controlPressEnd(dev,state){
-  if(pressTimer){
-    clearTimeout(pressTimer);
-    pressTimer=null;
-    control(dev,state); // short press → toggle
-  }
-}
-
-function renderEnableControls(enabled){
-  window.currentEnabled = enabled;
-  let devices = [
-    {key:'rain', label:'🌧️ Rain', icon:'🌧️'},
-    {key:'waterfall', label:'🏔️ Waterfall', icon:'🏔️'},
-    {key:'bubble', label:'🫧 Bubbles', icon:'🫧'},
-    {key:'mist', label:'🌫️ Mist', icon:'🌫️'},
-    {key:'heater', label:'🔥 Heater', icon:'🔥'},
-    {key:'fan', label:'🌀 Fan', icon:'🌀'},
-    {key:'led', label:'💡 LEDs', icon:'💡'}
-  ];
-  
-  let html = '';
-  devices.forEach(device => {
-    let isEnabled = enabled[device.key];
-    html += `<div class="enable-item">
-      <span>${device.icon} ${device.label}</span>
-      <div class="enable-toggle ${isEnabled ? 'enabled' : ''}" onclick="toggleEnable('${device.key}')"></div>
-    </div>`;
-  });
-  
-  document.getElementById('enableControls').innerHTML = html;
-}
-
-function render(j){
-  window.currentSticky=j.sticky; // track sticky
-  renderEnableControls(j.enabled);
-  
-  let autoTime=j.mode=='MANUAL'?Math.floor(j.autoIn/60)+':'+(j.autoIn%60).toString().padStart(2,'0'):'';
-  let manualLabel='📱 MANUAL MODE';
-  if(j.sticky) manualLabel+=' 🔒';
-  if(autoTime && !j.sticky) manualLabel+=' ('+autoTime+' to auto)';
-  let modeLine=(j.mode=='AUTO'?'🤖 AUTO MODE':manualLabel);
-  document.getElementById('status').innerHTML='<div class="mode '+(j.mode=='AUTO'?'auto':'manual')+'">'+modeLine+'</div>';
-
-  document.getElementById('dynamicContent').innerHTML=
-    '<div class="card"><h3>📊 Sensors</h3>'
-    +'<div class="sensor">🕒 Time<strong>'+j.time+'</strong></div>'
-    +'<div class="sensor">💧 Water<strong>'+j.waterLevel+'</strong><span class="status '+(j.water=='GOOD'?'good':'bad')+'">'+j.water+'</span></div>'
-    +'<div class="sensor">🌊 Water Temp<strong>'+(j.waterC==-999?'ERROR':j.waterC.toFixed(1)+'°C')+'</strong><span class="status '+(j.ds18b20Status=='OK'?'good':'warning')+'">DS18B20: '+j.ds18b20Status+'</span></div>'
-    +'<div class="sensor">💨 Humidity<strong>'+(j.humidity==-1?'ERROR':j.humidity.toFixed(1)+'%')+'</strong></div>'
-    +'<div class="sensor">🌡️ Air<strong>'+(j.ambient==-1?'ERROR':j.ambient.toFixed(1)+'°C')+'</strong></div>'
-    +'<div class="sensor">☀️ Light<strong>'+j.ldr+'</strong></div>'
-    +'</div>'
-    +'<div class="card"><h3>🎛️ Controls</h3><div class="controls">'
-    +buttonHTML('rain','🌧️ Rain',j.rain,j.enabled.rain)
-    +buttonHTML('waterfall','🏔️ Waterfall',j.wf,j.enabled.waterfall)
-    +buttonHTML('bubble','🫧 Bubbles',j.bubble,j.enabled.bubble)
-    +buttonHTML('mist','🌫️ Mist',j.mist,j.enabled.mist)
-    +buttonHTML('heater','🔥 Heater',j.heat,j.enabled.heater)
-    +buttonHTML('fan','🌀 Fan',j.fan,j.enabled.fan)
-    +buttonHTML('led','💡 LEDs',j.led,j.enabled.led)
-    +'<button class="control off" onclick="autoMode()" style="background:#666;color:#fff;">🤖 Return to Auto</button>'
-    +'</div></div>'
-    +'<div class="card"><h3>⚡ Quick Actions</h3><div class="controls">'
-    +'<button class="control on" onclick="macroMorning()">🌅 Morning</button>'
-    +'<button class="control off" onclick="macroNight()">🌙 Night</button>'
-    +'<button class="control on" onclick="macroMist()">💨 Mist Boost</button>'
-    +'<button class="control off" onclick="partyMode()">🎉 Party</button>'
-    +'</div></div>';
-
-  document.getElementById('health').textContent='DS18B20: '+j.ds18b20Status+' | Uptime: '+Math.floor(performance.now()/60000)+'m';
-
-  if(j.waterC!=-999){ historyTemp.push(j.waterC); if(historyTemp.length>30)historyTemp.shift(); }
-  if(j.humidity!=-1){ historyHum.push(j.humidity); if(historyHum.length>30)historyHum.shift(); }
-  if(j.ldr!=-1){ historyLight.push(j.ldr); if(historyLight.length>30)historyLight.shift(); }
-  drawGraph('tempGraph',historyTemp,'#ff6666');
-  drawGraph('humGraph',historyHum,'#66ccff');
-  drawGraph('lightGraph',historyLight,'#ffff66');
-
-  humTarget.value=j.config.humidityTarget; humTargetVal.textContent=j.config.humidityTarget;
-  mistDur.value=j.config.mistDuration; mistDurVal.textContent=j.config.mistDuration;
-  heatOn.value=j.config.heaterOn; heatOff.value=j.config.heaterOff; heatRange.textContent=heatOn.value+"–"+heatOff.value;
-  fanOn.value=j.config.fanOn; fanOff.value=j.config.fanOff; fanRange.textContent=fanOn.value+"–"+fanOff.value;
-  ledStart.value=j.config.ledDayStart; ledEnd.value=j.config.ledDayEnd; ledRange.textContent=ledStart.value+"–"+ledEnd.value;
-}
-
-function buttonHTML(dev,label,state,enabled){
-  if(!enabled) {
-    return '<button class="control disabled">'+label+' DISABLED</button>';
-  }
-  return '<button class="control '+(state=='ON'?'on':'off')+'" '
-    +'onmousedown="controlPressStart(\''+dev+'\',\''+(state=='ON'?'off':'on')+'\')" '
-    +'onmouseup="controlPressEnd(\''+dev+'\',\''+(state=='ON'?'off':'on')+'\')" '
-    +'ontouchstart="controlPressStart(\''+dev+'\',\''+(state=='ON'?'off':'on')+'\')" '
-    +'ontouchend="controlPressEnd(\''+dev+'\',\''+(state=='ON'?'off':'on')+'\')">'
-    +label+' '+state+'</button>';
-}
-
-// Quick actions
-function macroMorning(){control('rain','on');setTimeout(()=>control('rain','off'),5000);control('led','on');}
-function macroNight(){['led','fan','heater','mist'].forEach(d=>control(d,'off'));}
-function macroMist(){control('mist','on');setTimeout(()=>control('mist','off'),300000);}
-function partyMode(){['rain','waterfall','bubble','mist','heater','fan','led'].forEach(d=>control(d,'on'));setTimeout(()=>['rain','waterfall','bubble','mist','heater','fan','led'].forEach(d=>control(d,'off')),30000);}
-
-// Graph drawer
-function drawGraph(id,data,color){
-  let c=document.getElementById(id),ctx=c.getContext('2d');
-  ctx.clearRect(0,0,c.width,c.height);
-  ctx.strokeStyle=color;ctx.lineWidth=2;ctx.beginPath();
-  data.forEach((v,i)=>{let x=i*(c.width/30);let y=c.height-(v/100*c.height);if(i==0)ctx.moveTo(x,y);else ctx.lineTo(x,y);});
-  ctx.stroke();
-}
-
-// Config sliders → live send
-function sendConfig(){
-  let url='/config?humidity='+humTarget.value
-    +'&mist='+mistDur.value
-    +'&heaterOn='+heatOn.value
-    +'&heaterOff='+heatOff.value
-    +'&fanOn='+fanOn.value
-    +'&fanOff='+fanOff.value
-    +'&ledStart='+ledStart.value
-    +'&ledEnd='+ledEnd.value;
-  fetch(url).catch(e=>console.error("Config send failed",e));
-}
-function toggleTheme(){
-  document.body.classList.toggle('light');
-  localStorage.setItem('theme',document.body.classList.contains('light')?'light':'dark');
-}
-window.onload=()=>{
-  if(localStorage.getItem('theme')=='light')document.body.classList.add('light');
-  [humTarget,mistDur,heatOn,heatOff,fanOn,fanOff,ledStart,ledEnd].forEach(el=>{
-    el.oninput=function(){
-      if(this.id=='humTarget')humTargetVal.textContent=this.value;
-      if(this.id=='mistDur')mistDurVal.textContent=this.value;
-      if(this.id=='heatOn'||this.id=='heatOff')heatRange.textContent=heatOn.value+"–"+heatOff.value;
-      if(this.id=='fanOn'||this.id=='fanOff')fanRange.textContent=fanOn.value+"–"+fanOff.value;
-      if(this.id=='ledStart'||this.id=='ledEnd')ledRange.textContent=ledStart.value+"–"+ledEnd.value;
-      sendConfig();
-    };
-  });
-};
-connectWS();
-</script>
-</body>
-</html>
-)HTML";
 }
